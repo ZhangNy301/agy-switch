@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.0.2
+
+- macOS support: agy falls back to the legacy gemini-cli credential
+  (`~/.gemini/oauth_creds.json`, flat format) when its own token file is
+  absent — agy-switch now reads/writes both paths, converting formats as
+  needed. Fixes "login not completed" and the phantom already-logged-in
+  account on such installs
+- First run on a machine where agy is already logged in adopts that login as
+  the first profile instead of showing "no accounts yet"
+- Network self-check now honors the user's own env proxy (`HTTPS_PROXY` etc.)
+  instead of probing direct and crying "unreachable"; path tagging
+  distinguishes agy-switch proxy / env proxy / direct (shim included)
+
 ## 1.0.1
 
 - Fix crash on macOS when pressing Ctrl-C inside the proxy add/edit prompts:

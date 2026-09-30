@@ -38,6 +38,9 @@ os.umask(0o077)
 
 AGY_BIN = os.environ.get("AGY_BIN", "agy")
 LIVE = os.path.expanduser("~/.gemini/antigravity-cli/antigravity-oauth-token")
+# gemini-cli layout — agy falls back to it when its own file is absent
+# (seen in the wild on macOS installs that predate the antigravity-cli dir)
+LEGACY_LIVE = os.path.expanduser("~/.gemini/oauth_creds.json")
 OLD_STORE = os.path.expanduser("~/.local/share/agy-account")
 STORE = os.path.expanduser("~/.local/share/agy-switch")
 PROFILES = os.path.join(STORE, "profiles")
@@ -47,7 +50,7 @@ PROXY_ENV = os.path.join(STORE, "proxy.env")
 NETCHECK = os.path.join(STORE, ".netcheck")
 CURRENT = os.path.join(STORE, "current")  # profile name of the last switch/login
 
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 
 # proxy env present BEFORE we inject our own (apply_proxy_to_self) — used to
 # detect users who already have their own injection (e.g. from ~/.bashrc)
@@ -395,8 +398,62 @@ def list_profiles():
                   if f.endswith(".json") and valid_name(f[:-5]))
 
 
+def flat_to_nested(tok):
+    """gemini-cli's flat oauth_creds.json shape -> agy's nested token shape."""
+    exp = tok.get("expiry_date")  # epoch milliseconds
+    return {
+        "token": {
+            "access_token": tok.get("access_token", ""),
+            "token_type": tok.get("token_type") or "Bearer",
+            "refresh_token": tok.get("refresh_token", ""),
+            "expiry": (datetime.fromtimestamp(exp / 1000, timezone.utc)
+                       .isoformat().replace("+00:00", "Z") if exp else ""),
+        },
+        "auth_method": "oauth",
+        "id_token": tok.get("id_token", ""),
+    }
+
+
+def nested_to_flat(nested):
+    t = nested.get("token", {})
+    exp = parse_ts(t.get("expiry"))
+    return {
+        "access_token": t.get("access_token", ""),
+        "token_type": t.get("token_type") or "Bearer",
+        "refresh_token": t.get("refresh_token", ""),
+        "expiry_date": int(exp.timestamp() * 1000) if exp else 0,
+        "id_token": nested.get("id_token", ""),
+    }
+
+
+def read_cred(path):
+    """(nested-canonical token, style) for a credential file, else (None, None)."""
+    raw = load_json(path)
+    if not isinstance(raw, dict):
+        return None, None
+    if isinstance(raw.get("token"), dict) and raw["token"].get("refresh_token"):
+        return raw, "nested"
+    if raw.get("refresh_token"):
+        return flat_to_nested(raw), "flat"
+    return None, None
+
+
+def live_cred():
+    """The credential file agy actually uses: (path, nested token|None, style).
+    agy prefers its own file and falls back to the legacy gemini-cli one."""
+    for path in (LIVE, LEGACY_LIVE):
+        nested, style = read_cred(path)
+        if nested:
+            return path, nested, style
+    return LIVE, None, "nested"
+
+
+def write_live(nested, path, style):
+    write_json_atomic(path, nested if style == "nested" else nested_to_flat(nested))
+
+
 def live_token():
-    return load_json(LIVE)
+    return live_cred()[1]
 
 
 def get_current():
@@ -481,6 +538,27 @@ def warn_running_agy():
               "the login file; every new agy start auto-corrects back to this account)")
 
 
+def adopt_live_if_orphan():
+    """No profiles yet but agy is logged in (first run on a machine that already
+    used agy) — snapshot the live credential as the first profile."""
+    if list_profiles():
+        return None
+    _lp, live, _style = live_cred()
+    if not live:
+        return None
+    email = decode_email(live)
+    base = re.sub(r"[^A-Za-z0-9._-]", "-", email.split("@")[0]) or "account"
+    name, i = base, 2
+    while os.path.isfile(profile_path(name)):
+        name, i = f"{base}-{i}", i + 1
+    os.makedirs(PROFILES, exist_ok=True)
+    write_json_atomic(profile_path(name), live)
+    mark_active(name)
+    quota_for_profile(name)  # warm the cache so the first list shows real numbers
+    print(f"{GREEN}✓{RESET} adopted the current login as profile '{name}' ({email})")
+    return name
+
+
 def switch_to(name):
     src = profile_path(name)
     if not os.path.isfile(src):
@@ -492,13 +570,10 @@ def switch_to(name):
     except Exception:
         pass  # offline etc. — the stored refresh token is what matters
     # never lose an unsaved login: auto-backup the live token first
-    if valid_token_file(live_token()):
-        shutil.copyfile(LIVE, profile_path("_last"))
-        os.chmod(profile_path("_last"), 0o600)
-    tmp = f"{LIVE}.tmp.{os.getpid()}"
-    shutil.copyfile(src, tmp)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, LIVE)  # atomic: an interrupt can't truncate the live token
+    lp, live, style = live_cred()
+    if live:
+        write_json_atomic(profile_path("_last"), live)
+    write_live(load_json(src), lp, style)
     mark_active(name)
 
 
@@ -558,10 +633,12 @@ def cmd_logout(name, revoke):
         except Exception as e:
             die(f"revoke failed ({e}) — the grant is still valid, nothing was deleted")
         print(f"grant revoked at Google for {email}")
-    live = live_token()
-    was_live = valid_token_file(live) and refresh_token_of(live) == refresh_token_of(tok)
-    if was_live:
-        os.remove(LIVE)
+    was_live = False
+    for path in (LIVE, LEGACY_LIVE):
+        nested, _style = read_cred(path)
+        if nested and refresh_token_of(nested) == refresh_token_of(tok):
+            os.remove(path)
+            was_live = True
     os.remove(profile_path(name))
     meta = load_meta()
     meta.pop(name, None)
@@ -597,18 +674,30 @@ def cmd_login():
             os.remove(p)
     os.makedirs(PROFILES, exist_ok=True)
 
-    had_live = valid_token_file(live_token())
-    if had_live:
-        shutil.copyfile(LIVE, profile_path("_last"))  # same auto-backup as `use`
-        os.chmod(profile_path("_last"), 0o600)
-        os.rename(LIVE, stash)
+    lp, live, style = live_cred()
+    stashed_rt = ""
+    if live:
+        write_json_atomic(profile_path("_last"), live)  # same auto-backup as `use`
+        stashed_rt = refresh_token_of(live)
+        write_json_atomic(stash, {"path": lp, "style": style, "token": live})
+        os.remove(lp)
+
+    def find_new_cred():
+        """A freshly-written credential at either known path (not the stashed
+        one — a still-running agy of the old account can rewrite its file)."""
+        for path in (LIVE, LEGACY_LIVE):
+            nested, _s = read_cred(path)
+            if nested and refresh_token_of(nested) != stashed_rt:
+                return nested
+        return None
 
     stop = threading.Event()
 
     def watch():
         while not stop.is_set():
-            if valid_token_file(load_json(LIVE)):
-                shutil.copyfile(LIVE, pending)
+            nested = find_new_cred()
+            if nested:
+                write_json_atomic(pending, nested)
                 return
             time.sleep(0.5)
 
@@ -625,8 +714,10 @@ def cmd_login():
         watcher.join(timeout=2)
 
     # the poll loop can miss a token written in agy's final moments — check once more
-    if not os.path.isfile(pending) and valid_token_file(load_json(LIVE)):
-        shutil.copyfile(LIVE, pending)
+    if not os.path.isfile(pending):
+        nested = find_new_cred()
+        if nested:
+            write_json_atomic(pending, nested)
 
     if os.path.isfile(pending):
         tok = load_json(pending)
@@ -662,7 +753,10 @@ def cmd_login():
         print("run `agy-switch` to pick an account next time")
     else:
         if os.path.exists(stash):
-            os.rename(stash, LIVE)
+            st = load_json(stash) or {}
+            if st.get("token"):
+                write_live(st["token"], st.get("path") or LIVE, st.get("style") or "nested")
+            os.remove(stash)
             print("login not completed — original account restored, nothing changed")
         else:
             print("login not completed — no token was written")
@@ -745,6 +839,9 @@ def account_block(name, active, q, last, email, cursor=False):
 def cmd_ls():
     names = [n for n in list_profiles() if n != "_last"]
     if not names:
+        adopt_live_if_orphan()
+        names = [n for n in list_profiles() if n != "_last"]
+    if not names:
         print("no accounts yet — run: agy-switch login")
         return
     active = active_profile_name()
@@ -811,6 +908,9 @@ def tui(action="switch"):
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         die("interactive mode needs a terminal — use 'agy-switch ls' / 'agy-switch use <name>'")
     names = [n for n in list_profiles() if n != "_last"]
+    if not names:
+        adopt_live_if_orphan()
+        names = [n for n in list_profiles() if n != "_last"]
     if not names:
         die("no accounts yet — run: agy-switch login")
 
@@ -945,11 +1045,14 @@ fi
 
 # network quality probe: reachability + exit-IP region (cached: 6h after a good
 # result, 10min after a bad one, so normal starts cost nothing). Results are only
-# reused for the same path tag (P:host:port vs D) — toggling the proxy re-probes.
+# reused for the same path tag (P:/E:host:port vs D) — changing path re-probes.
 # cache format: "epoch state cc tag" — state 0=blocked 1=ok 2=unsupported region
 TAG="D"
 if [ "$USE" = "1" ]; then
   TAG="P:$(printf '%s' "${HTTPS_PROXY:-${https_proxy:-}}" | sed 's|^[a-zA-Z]*://||; s|.*@||; s|/.*||')"
+elif [ -n "${HTTPS_PROXY:-${https_proxy:-}}" ]; then
+  # user's own env proxy (e.g. from ~/.bashrc) — probe goes through it too
+  TAG="E:$(printf '%s' "${HTTPS_PROXY:-${https_proxy:-}}" | sed 's|^[a-zA-Z]*://||; s|.*@||; s|/.*||')"
 fi
 CK="$HOME/.local/share/agy-switch/.netcheck"
 LAST=0; OK=1; CC=""; CTAG=""
@@ -1167,10 +1270,14 @@ UNSUPPORTED_REGIONS = {"CN", "HK", "MO", "RU", "BY", "IR", "KP", "CU", "SY"}
 
 def net_tag():
     """Which network path will agy take right now? 'P:host:port' via the active
-    proxy, or 'D' for direct. Cached probe results are only valid for the same path."""
+    agy-switch proxy, 'E:host:port' via the user's own env proxy, or 'D' direct.
+    Cached probe results are only valid for the same path."""
     name, cfg, state = active_proxy()
     if state == "on":
         return f"P:{cfg.get('host')}:{cfg.get('port')}"
+    env = proxy_from_env()
+    if env:
+        return f"E:{env.get('host')}:{env.get('port')}"
     return "D"
 
 
@@ -1189,12 +1296,15 @@ def net_ok():
             return {"0": "blocked", "1": "ok"}.get(state, "region"), cc
     except (OSError, ValueError):
         pass
-    # probe through the same path agy will take: the configured proxy when enabled
-    # (via curl — urllib can't do https:// or socks proxies), else direct.
+    # probe through the same path agy will take: the configured proxy when
+    # enabled, else the user's own env proxy (via curl — urllib can't do
+    # https:// or socks proxies), else direct.
     px = []
     _pn, pcfg, _ps = active_proxy()
     if tag.startswith("P:") and pcfg and shutil.which("curl"):
         px = ["-x", proxy_url(pcfg)]
+    elif tag.startswith("E:") and shutil.which("curl"):
+        px = ["-x", ENV_PROXY_URL]
     def get(url):
         if px:
             r = subprocess.run(["curl", "-s", "--max-time", "3"] + px + [url],

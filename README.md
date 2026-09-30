@@ -72,7 +72,7 @@ Add flow asks only for `server`, `port`, `username?`, `password?` — the protoc
 
 ## How it works
 
-- A **profile** is a snapshot of agy's OAuth token (`~/.gemini/antigravity-cli/antigravity-oauth-token`). Switching copies the snapshot back. Tokens never appear on the command line or in output.
+- A **profile** is a snapshot of agy's OAuth token. Switching copies the snapshot back. Tokens never appear on the command line or in output. Both credential locations agy uses are supported: `~/.gemini/antigravity-cli/antigravity-oauth-token` (preferred) and the legacy gemini-cli-style `~/.gemini/oauth_creds.json` (some macOS installs). First run on a machine where agy is already logged in adopts that login as the first profile automatically.
 - Data lives in `~/.local/share/agy-switch/` (profiles, quota cache, proxy configs).
 - When a proxy is enabled, agy-switch installs a tiny shim at `~/.local/bin/agy` that exports the proxy environment and then execs the real `agy`. Your shell's own `http_proxy`/`https_proxy` still wins if you exported them.
 - Quotas are read from agy's local state and refreshed in the background; cached values are shown when refresh fails.
