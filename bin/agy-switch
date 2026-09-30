@@ -50,7 +50,7 @@ PROXY_ENV = os.path.join(STORE, "proxy.env")
 NETCHECK = os.path.join(STORE, ".netcheck")
 CURRENT = os.path.join(STORE, "current")  # profile name of the last switch/login
 
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 
 # proxy env present BEFORE we inject our own (apply_proxy_to_self) — used to
 # detect users who already have their own injection (e.g. from ~/.bashrc)
@@ -263,14 +263,18 @@ def _json_call(url, body, headers=None, timeout=20):
     return json.load(urllib.request.urlopen(req, timeout=timeout))
 
 
-def ensure_fresh_token(profile_path):
+def ensure_fresh_token(profile_path, force=False):
     """Refresh a profile's access token if expired; rewrite the profile file.
-    Returns the parsed token dict (fresh if all went well)."""
+    Returns the parsed token dict (fresh if all went well).
+    force=True refreshes even a live access token — needed when the id_token
+    (account identity) may be stale: agy rotates access/refresh tokens on
+    refresh but never rewrites id_token, so only a fresh refresh response
+    proves which account the credential really belongs to."""
     tok = load_json(profile_path)
     if not valid_token_file(tok):
         raise ValueError("not a token file")
     exp = parse_ts(tok.get("token", {}).get("expiry"))
-    if exp and (exp - datetime.now(timezone.utc)).total_seconds() > 120:
+    if not force and exp and (exp - datetime.now(timezone.utc)).total_seconds() > 120:
         return tok
     cands = oauth_client_candidates()
     if not cands:
@@ -395,7 +399,8 @@ def list_profiles():
     if not os.path.isdir(PROFILES):
         return []
     return sorted(f[:-5] for f in os.listdir(PROFILES)
-                  if f.endswith(".json") and valid_name(f[:-5]))
+                  if f.endswith(".json") and not f.startswith(".")
+                  and valid_name(f[:-5]))
 
 
 def flat_to_nested(tok):
@@ -540,22 +545,43 @@ def warn_running_agy():
 
 def adopt_live_if_orphan():
     """No profiles yet but agy is logged in (first run on a machine that already
-    used agy) — snapshot the live credential as the first profile."""
+    used agy) — snapshot the live credential as the first profile.
+
+    Refresh BEFORE naming: agy rotates access/refresh tokens but leaves
+    id_token stale, so a cached id_token can name a PREVIOUS account. Only the
+    refresh response's fresh id_token identifies the real account."""
     if list_profiles():
         return None
     _lp, live, _style = live_cred()
     if not live:
         return None
+    os.makedirs(PROFILES, exist_ok=True)
+    tmp = profile_path(".adopting")
+    write_json_atomic(tmp, live)
+    refreshed = False
+    try:
+        ensure_fresh_token(tmp, force=True)
+        live = load_json(tmp) or live
+        refreshed = True
+    except Exception:
+        pass
     email = decode_email(live)
     base = re.sub(r"[^A-Za-z0-9._-]", "-", email.split("@")[0]) or "account"
     name, i = base, 2
     while os.path.isfile(profile_path(name)):
         name, i = f"{base}-{i}", i + 1
-    os.makedirs(PROFILES, exist_ok=True)
-    write_json_atomic(profile_path(name), live)
+    try:
+        os.rename(tmp, profile_path(name))
+    except OSError:
+        write_json_atomic(profile_path(name), live)
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
     mark_active(name)
     quota_for_profile(name)  # warm the cache so the first list shows real numbers
-    print(f"{GREEN}✓{RESET} adopted the current login as profile '{name}' ({email})")
+    note = "" if refreshed else f" {DIM}(offline — identity from cached token){RESET}"
+    print(f"{GREEN}✓{RESET} adopted the current login as profile '{name}' ({email}){note}")
     return name
 
 
@@ -932,13 +958,15 @@ def tui(action="switch"):
                 state["stale"].add(name)
             else:
                 state["stale"].discard(name)
+                # a refresh may have rewritten id_token (agy never updates it
+                # itself) — re-decode so a mis-cached email corrects itself
+                if name in static:
+                    email = decode_email(load_json(profile_path(name)) or {})
+                    static[name] = (email, static[name][1])
 
     def kick_refresh(force=False):
         for n in names:
             threading.Thread(target=refresh_worker, args=(n, force), daemon=True).start()
-
-    if action == "switch":
-        kick_refresh()  # quota is irrelevant when picking an account to log out
 
     # static row data: only quota changes while the TUI is open
     meta = load_meta()
@@ -948,6 +976,9 @@ def tui(action="switch"):
         act = meta.get(n, {}).get("activated_at")
         last = rel_time(datetime.fromtimestamp(act, timezone.utc)) if act else "never"
         static[n] = (email, last)
+
+    if action == "switch":
+        kick_refresh()  # quota is irrelevant when picking an account to log out
 
     def render():
         with lock:

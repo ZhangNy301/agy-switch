@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.0.3
+
+- Fix account misidentification when adopting a live login whose id_token is
+  stale: agy rotates access/refresh tokens on refresh but never rewrites
+  id_token, so the cached id_token can name a PREVIOUS account that once
+  logged in on the same machine. Adoption now refreshes the token first and
+  names the profile from the fresh identity in the refresh response
+- The picker re-decodes the displayed email after a quota refresh, so a
+  mis-cached identity corrects itself once the token is refreshed
+
 ## 1.0.2
 
 - macOS support: agy falls back to the legacy gemini-cli credential
