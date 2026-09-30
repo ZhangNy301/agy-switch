@@ -47,7 +47,7 @@ PROXY_ENV = os.path.join(STORE, "proxy.env")
 NETCHECK = os.path.join(STORE, ".netcheck")
 CURRENT = os.path.join(STORE, "current")  # profile name of the last switch/login
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 
 # proxy env present BEFORE we inject our own (apply_proxy_to_self) — used to
 # detect users who already have their own injection (e.g. from ~/.bashrc)
@@ -576,6 +576,20 @@ def cmd_logout(name, revoke):
 def cmd_login():
     """Add an account without losing the current one: stash the live token,
     run agy so it does its browser OAuth, snapshot whatever it writes."""
+    net, cc = net_ok()
+    if net != "ok":
+        why = ("Google's API is unreachable from this network" if net == "blocked"
+               else f"your IP region ({cc or '?'}) is not supported by Google AI")
+        print(f"{YELLOW}⚠ {why} — the login callback will likely hang.{RESET}")
+        print("  fix: agy-switch proxy (add a proxy through a supported region first)")
+        if not sys.stdin.isatty():
+            sys.exit(1)
+        try:
+            if input("  continue anyway? [y/N] ").strip().lower() not in ("y", "yes"):
+                sys.exit(1)
+        except (KeyboardInterrupt, EOFError):
+            print()
+            sys.exit(1)
     stash = os.path.join(STORE, ".stash-token")
     pending = os.path.join(STORE, ".pending-token")
     for p in (stash, pending):
@@ -756,8 +770,13 @@ def read_term_key(fd):
     """One keypress from a raw-mode terminal. Arrows -> 'up'/'down', Enter ->
     'enter', bare Esc -> 'esc'. Waits up to 150ms for the rest of an escape
     sequence — tmux/ssh/multiplexers can split the ESC [ A bytes apart, and a
-    short one-shot read would mistake an arrow key for a bare Esc."""
-    ch = os.read(fd, 1)
+    short one-shot read would mistake an arrow key for a bare Esc.
+    A tty that went away (EIO: hangup, or the parent process died and the
+    shell reclaimed the foreground) reads as 'esc' so callers quit cleanly."""
+    try:
+        ch = os.read(fd, 1)
+    except OSError:
+        return "esc"
     if ch != b"\x1b":
         if ch in (b"\r", b"\n"):
             return "enter"
@@ -765,13 +784,25 @@ def read_term_key(fd):
     seq = b""
     end = time.time() + 0.15
     while len(seq) < 2:
-        r, _, _ = select.select([fd], [], [], max(0, end - time.time()))
-        if not r:
-            break
-        seq += os.read(fd, 2 - len(seq))
+        try:
+            r, _, _ = select.select([fd], [], [], max(0, end - time.time()))
+            if not r:
+                break
+            seq += os.read(fd, 2 - len(seq))
+        except OSError:
+            return "esc"
     if not seq:
         return "esc"
     return {b"[A": "up", b"[B": "down", b"OA": "up", b"OB": "down"}.get(seq[:2], "esc")
+
+
+def restore_termios(fd, old):
+    """Best-effort terminal restore — the tty may already be gone (EIO)."""
+    import termios
+    try:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    except (OSError, termios.error):
+        pass
 
 
 def tui(action="switch"):
@@ -874,9 +905,12 @@ def tui(action="switch"):
                 break
             render()
     finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
-        sys.stdout.write(f"{ESC}[?25h{ESC}[?1049l")  # show cursor, leave alt screen
-        sys.stdout.flush()
+        restore_termios(fd, old)
+        try:
+            sys.stdout.write(f"{ESC}[?25h{ESC}[?1049l")  # show cursor, leave alt screen
+            sys.stdout.flush()
+        except OSError:
+            pass
 
     return state["switched"]
 
@@ -1615,7 +1649,7 @@ def proxy_manager():
 
     def line_input(prompt, secret=False):
         """One cooked-mode input line inside the alt screen (for field edits)."""
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        restore_termios(fd, old)
         sys.stdout.write(f"{ESC}[?25h\r\n {CYAN}{prompt}{RESET} ")
         sys.stdout.flush()
         try:
@@ -1678,7 +1712,7 @@ def proxy_manager():
                 esel = (esel - 1) % len(fields)
             elif k in ("down", "j"):
                 esel = (esel + 1) % len(fields)
-            elif k in ("q", "esc"):
+            elif k in ("q", "esc", "\x03"):
                 return None
             elif k == "d":
                 break
@@ -1812,7 +1846,7 @@ def proxy_manager():
                 state["sel"] = (state["sel"] - 1) % len(ns)
             elif k in ("down", "j") and ns:
                 state["sel"] = (state["sel"] + 1) % len(ns)
-            elif k in ("q", "esc"):
+            elif k in ("q", "esc", "\x03"):
                 break
             elif k == " " and ns:  # space: toggle in place
                 n = ns[state["sel"]]
@@ -1832,7 +1866,7 @@ def proxy_manager():
                 break
             elif k == "a":
                 sys.stdout.write(f"{ESC}[?1049l{ESC}[?25h")
-                termios.tcsetattr(fd, termios.TCSADRAIN, old)
+                restore_termios(fd, old)
                 proxy_wizard(db)          # saves + enables on its own
                 db = load_proxy_db()
                 kick_probes(force=True)
@@ -1881,9 +1915,12 @@ def proxy_manager():
             render()
     finally:
         save_proxy_db(db)  # persist probe cache
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
-        sys.stdout.write(f"{ESC}[?25h{ESC}[?1049l")
-        sys.stdout.flush()
+        restore_termios(fd, old)
+        try:
+            sys.stdout.write(f"{ESC}[?25h{ESC}[?1049l")
+            sys.stdout.flush()
+        except OSError:
+            pass
     if state.get("exit_msg"):
         print(state["exit_msg"])
 

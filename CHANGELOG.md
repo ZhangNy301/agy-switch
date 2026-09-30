@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.0.1
+
+- Fix crash on macOS when pressing Ctrl-C inside the proxy add/edit prompts:
+  the npm launcher exited on SIGINT before the Python process, the shell
+  reclaimed the terminal, and the next tty read failed with EIO — leaving the
+  screen stuck in the alt buffer. The launcher now forwards signals and
+  outlives the child; tty reads/restores are EIO-safe
+- Ctrl-C (`^C`) now quits the proxy manager and field editor
+- `login` checks the network first and warns (with a proxy hint) when Google
+  APIs are unreachable or the IP region is unsupported, instead of letting
+  the browser callback hang silently
+
 ## 1.0.0
 
 Initial public release.
