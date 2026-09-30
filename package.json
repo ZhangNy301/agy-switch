@@ -1,0 +1,38 @@
+{
+  "name": "agy-switch",
+  "version": "1.0.0",
+  "description": "Multi-account manager for Antigravity CLI (agy): switch Google accounts, view model quotas, and route agy through managed proxies",
+  "keywords": [
+    "agy",
+    "antigravity",
+    "gemini",
+    "claude",
+    "cli",
+    "account-switcher",
+    "proxy"
+  ],
+  "license": "MIT",
+  "author": "ZhangNy301",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ZhangNy301/agy-switch.git"
+  },
+  "homepage": "https://github.com/ZhangNy301/agy-switch#readme",
+  "bugs": "https://github.com/ZhangNy301/agy-switch/issues",
+  "bin": {
+    "agy-switch": "lib/launcher.js",
+    "asw": "lib/launcher.js"
+  },
+  "files": [
+    "bin/agy-switch",
+    "lib/launcher.js",
+    "install.sh"
+  ],
+  "engines": {
+    "node": ">=14"
+  },
+  "os": [
+    "linux",
+    "darwin"
+  ]
+}

@@ -1,0 +1,1981 @@
+#!/usr/bin/env python3
+# agy-switch — multi-account manager for Antigravity CLI (agy) on Linux.
+#
+# agy keeps one OAuth token at ~/.gemini/antigravity-cli/antigravity-oauth-token.
+# A "profile" is a snapshot of that file. Switching = copying a snapshot back.
+#
+# Usage:
+#   agy-switch              interactive picker (arrows + Enter)
+#   agy-switch list         same as above
+#   agy-switch ls           plain list, no TUI (cached quota)
+#   agy-switch login        add another account (browser login via agy)
+#   agy-switch use <name>   switch to profile <name> (non-interactive)
+#   agy-switch rename <a> <b>   rename a profile
+#   agy-switch logout [name] [--revoke]   sign an account out of this machine
+#                           (interactive picker when no name; --revoke also kills
+#                           the grant at Google)
+#   agy-switch proxy [on|off|status]      route agy through a proxy
+#                           (no argument: interactive setup)
+#
+# Tokens never appear on a command line or in this tool's output.
+
+import getpass
+import json
+import os
+import re
+import select
+import shlex
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+
+os.umask(0o077)
+
+AGY_BIN = os.environ.get("AGY_BIN", "agy")
+LIVE = os.path.expanduser("~/.gemini/antigravity-cli/antigravity-oauth-token")
+OLD_STORE = os.path.expanduser("~/.local/share/agy-account")
+STORE = os.path.expanduser("~/.local/share/agy-switch")
+PROFILES = os.path.join(STORE, "profiles")
+META_FILE = os.path.join(STORE, "meta.json")
+PROXY_FILE = os.path.join(STORE, "proxy.json")
+PROXY_ENV = os.path.join(STORE, "proxy.env")
+NETCHECK = os.path.join(STORE, ".netcheck")
+CURRENT = os.path.join(STORE, "current")  # profile name of the last switch/login
+
+VERSION = "1.0.0"
+
+# proxy env present BEFORE we inject our own (apply_proxy_to_self) — used to
+# detect users who already have their own injection (e.g. from ~/.bashrc)
+ENV_PROXY_URL = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or ""
+
+TOKEN_URL = "https://oauth2.googleapis.com/token"
+REVOKE_URL = "https://oauth2.googleapis.com/revoke"
+CLOUDCODE = "https://daily-cloudcode-pa.googleapis.com"  # the host agy itself uses
+
+# agy's OAuth client is an installed-app credential embedded in the agy binary
+# (the same style Gemini CLI ships — public by design, not a user secret). The
+# binary contains several client id/secret strings with no reliable pairing
+# order, so we extract all candidates and let the token endpoint itself tell
+# us which pair works (a wrong pair just gets invalid_client). The working
+# pair is cached on disk so the binary scan is a one-time thing.
+_OAUTH_CACHE = os.path.join(STORE, "oauth-client.json")
+
+
+def real_agy_binary():
+    """Path of the real agy binary, looking through our own shim if installed."""
+    agy = shutil.which("agy")
+    for path in (agy, agy + ".real" if agy else None,
+                 os.path.expanduser("~/.local/bin/agy.real")):
+        if path and os.path.isfile(path) and not is_shim(path):
+            return path
+    return None
+
+
+def _scan_oauth_strings(path):
+    """All client-id / client-secret strings found in the agy binary."""
+    pats = {"id": re.compile(rb"\d{6,}-[a-z0-9]+\.apps\.googleusercontent\.com"),
+            "secret": re.compile(rb"GOCSPX-(?:(?!GOCSPX-)[A-Za-z0-9_\-])+")}
+    got = {"id": [], "secret": []}
+    tail, eof = b"", False
+    with open(path, "rb") as f:
+        while not eof:
+            chunk = f.read(4 * 1024 * 1024)
+            eof = not chunk
+            buf = tail + chunk
+            for k, pat in pats.items():
+                for m in pat.finditer(buf):
+                    if not eof and m.end() > len(buf) - 64:
+                        continue  # may be cut mid-string — next chunk re-covers it
+                    s = m.group().decode()
+                    if s not in got[k]:
+                        got[k].append(s)
+            tail = buf[-256:]
+    return got
+
+
+def oauth_client_candidates():
+    """Yield (client_id, client_secret) pairs to try, most-likely first: env
+    override, then the last known working pair, then id × secret scanned from
+    the binary. Lazy: the 200MB+ binary scan never happens when a known pair
+    succeeds first."""
+    seen = set()
+
+    def emit(pair):
+        if all(pair) and pair not in seen:
+            seen.add(pair)
+            return pair
+        return None
+
+    env = (os.environ.get("AGY_SWITCH_CLIENT_ID"),
+           os.environ.get("AGY_SWITCH_CLIENT_SECRET"))
+    p = emit(env)
+    if p:
+        yield p
+    try:
+        saved = load_json(_OAUTH_CACHE)
+        p = emit((saved.get("client_id"), saved.get("client_secret")))
+        if p:
+            yield p
+    except Exception:
+        pass
+    path = real_agy_binary()
+    if path:
+        try:
+            got = _scan_oauth_strings(path)
+            for cid in got["id"]:
+                for secret in got["secret"]:
+                    p = emit((cid, secret))
+                    if p:
+                        yield p
+        except OSError:
+            pass
+
+
+def remember_oauth_client(pair):
+    write_json_atomic(_OAUTH_CACHE, {"client_id": pair[0], "client_secret": pair[1]})
+
+QUOTA_TTL = 300  # seconds; older cache gets refreshed in the background
+
+
+def die(msg, code=1):
+    print(f"agy-switch: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def parse_ts(s):
+    """RFC3339 (allowing nanoseconds) -> aware datetime, or None."""
+    if not s:
+        return None
+    try:
+        s = s.strip()
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        if "." in s:
+            head, tail = s.split(".", 1)
+            frac = re.match(r"\d+", tail).group(0)[:6]
+            s = head + "." + frac + tail[len(re.match(r"\d+", tail).group(0)):]
+        return datetime.fromisoformat(s)
+    except Exception:
+        return None
+
+
+def rel_time(dt):
+    """Compact relative time like '3m', '4d21h', '2h13m'."""
+    if not dt:
+        return "?"
+    secs = int((dt - datetime.now(timezone.utc)).total_seconds())
+    past = secs < 0
+    secs = abs(secs)
+    d, secs = divmod(secs, 86400)
+    h, secs = divmod(secs, 3600)
+    m = secs // 60
+    if d:
+        out = f"{d}d{h}h" if h else f"{d}d"
+    elif h:
+        out = f"{h}h{m}m" if m else f"{h}h"
+    elif m:
+        out = f"{m}m"
+    elif past:
+        return "just now"
+    else:
+        out = "now"
+    return f"{out} ago" if past else out
+
+
+def load_json(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def write_json_atomic(path, obj):
+    tmp = f"{path}.tmp.{os.getpid()}"
+    with open(tmp, "w") as f:
+        json.dump(obj, f)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def decode_email(tok):
+    try:
+        import base64
+        part = tok.get("id_token", "").split(".")[1]
+        part += "=" * (-len(part) % 4)
+        return json.loads(base64.urlsafe_b64decode(part)).get("email", "?")
+    except Exception:
+        return "?"
+
+
+def valid_token_file(tok):
+    return isinstance(tok, dict) and tok.get("token", {}).get("refresh_token")
+
+
+def refresh_token_of(tok):
+    return tok.get("token", {}).get("refresh_token", "")
+
+
+# ---------------------------------------------------------------- meta store
+
+def load_meta():
+    return load_json(META_FILE) or {}
+
+
+def save_meta(meta):
+    os.makedirs(STORE, exist_ok=True)
+    write_json_atomic(META_FILE, meta)
+
+
+# ---------------------------------------------------------------- token ops
+
+def _json_call(url, body, headers=None, timeout=20):
+    """POST `body` (bytes) to `url`, return parsed JSON. Uses urllib normally, but
+    urllib can only tunnel through plain http:// proxies — when the effective proxy
+    is https:// or socks, shell out to curl (which honors the env proxy vars)."""
+    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or ""
+    scheme = urllib.parse.urlparse(proxy).scheme.lower()
+    if scheme in ("https", "socks5", "socks5h") and shutil.which("curl"):
+        cmd = ["curl", "-s", "--max-time", str(timeout), "--data-binary", "@-",
+               "-w", "\n%{http_code}"]
+        for k, v in (headers or {}).items():
+            cmd += ["-H", f"{k}: {v}"]
+        r = subprocess.run(cmd + [url], input=body, capture_output=True)
+        if r.returncode != 0:
+            raise OSError(f"curl POST {url} failed (exit {r.returncode})")
+        data, _, code = r.stdout.rpartition(b"\n")
+        code = int(code)
+        if code >= 400:
+            raise urllib.error.HTTPError(url, code, data[:200].decode(errors="replace"),
+                                         None, None)
+        return json.loads(data)
+    req = urllib.request.Request(url, data=body, method="POST")
+    for k, v in (headers or {}).items():
+        req.add_header(k, v)
+    return json.load(urllib.request.urlopen(req, timeout=timeout))
+
+
+def ensure_fresh_token(profile_path):
+    """Refresh a profile's access token if expired; rewrite the profile file.
+    Returns the parsed token dict (fresh if all went well)."""
+    tok = load_json(profile_path)
+    if not valid_token_file(tok):
+        raise ValueError("not a token file")
+    exp = parse_ts(tok.get("token", {}).get("expiry"))
+    if exp and (exp - datetime.now(timezone.utc)).total_seconds() > 120:
+        return tok
+    cands = oauth_client_candidates()
+    if not cands:
+        raise OSError("agy OAuth client not found (is agy installed?)")
+    r, last_err = None, None
+    for cid, secret in cands:
+        body = urllib.parse.urlencode({
+            "client_id": cid,
+            "client_secret": secret,
+            "refresh_token": tok["token"]["refresh_token"],
+            "grant_type": "refresh_token",
+        }).encode()
+        try:
+            r = _json_call(TOKEN_URL, body,
+                           {"Content-Type": "application/x-www-form-urlencoded"})
+            remember_oauth_client((cid, secret))
+            break
+        except urllib.error.HTTPError as e:
+            last_err = e
+            if e.code in (400, 401):  # invalid_client / invalid_grant — wrong pair
+                continue
+            raise
+    if r is None:
+        raise last_err or OSError("no working OAuth client pair found")
+    tok["token"]["access_token"] = r["access_token"]
+    tok["token"]["expiry"] = datetime.fromtimestamp(
+        time.time() + r.get("expires_in", 3600) - 30,
+        timezone.utc).isoformat().replace("+00:00", "Z")
+    if r.get("id_token"):
+        tok["id_token"] = r["id_token"]
+    if r.get("refresh_token"):
+        tok["token"]["refresh_token"] = r["refresh_token"]
+    write_json_atomic(profile_path, tok)
+    return tok
+
+
+def post(access_token, endpoint, payload=None):
+    return _json_call(CLOUDCODE + endpoint, json.dumps(payload or {}).encode(),
+                      {"Authorization": f"Bearer {access_token}",
+                       "Content-Type": "application/json",
+                       "User-Agent": "antigravity/1.2.9"})
+
+
+def fetch_quota(access_token):
+    """One call: subscription tier + 5h/weekly buckets for Gemini and Claude."""
+    out = {}
+    try:
+        lc = post(access_token, "/v1internal:loadCodeAssist",
+                  {"metadata": {"ideType": "ANTIGRAVITY", "pluginType": "GEMINI"}})
+        paid = lc.get("paidTier") or {}
+        pid = paid.get("id", "").lower()
+        if "ultra" in pid:
+            out["tier"] = "Ultra"
+        elif "pro" in pid:
+            out["tier"] = "Pro"
+        elif paid:
+            out["tier"] = paid.get("name", "?")
+        else:
+            out["tier"] = {"free-tier": "Free", "standard-tier": "Standard"}.get(
+                (lc.get("currentTier") or {}).get("id", ""), "?")
+    except Exception:
+        out["tier"] = "?"
+    try:
+        qs = post(access_token, "/v1internal:retrieveUserQuotaSummary")
+        for group in qs.get("groups", []):
+            name = (group.get("displayName") or "").lower()
+            key = "gemini" if "gemini" in name else "claude"
+            for b in group.get("buckets", []):
+                w = b.get("window")
+                if w not in ("5h", "weekly"):
+                    continue
+                out[f"{key}_{w}"] = b.get("remainingFraction")
+                out[f"{key}_{w}_reset"] = b.get("resetTime")
+                # e.g. "You have hit your weekly limit, the 5-hour limit
+                # does not currently apply" — the bucket reads 100% but is moot
+                if "does not currently apply" in (b.get("description") or ""):
+                    out[f"{key}_{w}_disabled"] = True
+        out["host"] = CLOUDCODE  # cache is only valid for the endpoint that produced it
+    except Exception:
+        pass
+    return out
+
+
+def quota_for_profile(name, force=False):
+    """Return cached quota; refresh from network if stale/missing (or forced).
+    Returns (quota_dict, is_fresh)."""
+    meta = load_meta()
+    entry = meta.get(name, {})
+    cached = entry.get("quota")
+    if cached and cached.get("host") != CLOUDCODE:
+        cached = None  # produced by a different endpoint — not trustworthy
+    age = time.time() - entry.get("quota_at", 0)
+    if cached and not force and age < QUOTA_TTL:
+        return cached, True
+    try:
+        tok = ensure_fresh_token(os.path.join(PROFILES, f"{name}.json"))
+        q = fetch_quota(tok["token"]["access_token"])
+        if "host" in q:  # the quota call actually succeeded — safe to cache
+            entry["quota"] = q
+            entry["quota_at"] = time.time()
+            meta[name] = entry
+            save_meta(meta)
+            return q, True
+        if q:  # partial (e.g. tier only) — show this run, don't poison the cache
+            return q, False
+    except Exception:
+        pass
+    return (cached or {}), False
+
+
+# ---------------------------------------------------------------- profile ops
+
+def valid_name(name):
+    return bool(re.fullmatch(r"[A-Za-z0-9._-]+", name or ""))
+
+
+def profile_path(name):
+    return os.path.join(PROFILES, f"{name}.json")
+
+
+def list_profiles():
+    if not os.path.isdir(PROFILES):
+        return []
+    return sorted(f[:-5] for f in os.listdir(PROFILES)
+                  if f.endswith(".json") and valid_name(f[:-5]))
+
+
+def live_token():
+    return load_json(LIVE)
+
+
+def get_current():
+    """Profile name recorded at the last switch/login (None if never or gone)."""
+    try:
+        name = open(CURRENT).read().strip()
+    except OSError:
+        return None
+    return name if valid_name(name) and os.path.isfile(profile_path(name)) else None
+
+
+def set_current(name):
+    os.makedirs(STORE, exist_ok=True)
+    with open(CURRENT, "w") as f:
+        f.write(name)
+
+
+def clear_current(name):
+    if get_current() == name:
+        try:
+            os.remove(CURRENT)
+        except OSError:
+            pass
+
+
+def active_profile_name():
+    """The account agy-switch last switched to. Falls back to matching the live
+    token (first run, or a login made outside agy-switch). Prefer the record over
+    the token file: a still-running agy rewrites the live file on token refresh,
+    which would otherwise make the display flap back to the old account."""
+    cur = get_current()
+    if cur:
+        return cur
+    live = live_token()
+    if not valid_token_file(live):
+        return None
+    rt = refresh_token_of(live)
+    for name in list_profiles():
+        tok = load_json(profile_path(name))
+        if valid_token_file(tok) and refresh_token_of(tok) == rt:
+            return name
+    return None
+
+
+def live_was_clobbered():
+    """True when the recorded current account no longer matches the live token —
+    a running agy refreshed and overwrote it. The shim re-asserts on next start."""
+    cur = get_current()
+    if not cur:
+        return False
+    live, prof = live_token(), load_json(profile_path(cur))
+    if not (valid_token_file(live) and valid_token_file(prof)):
+        return False
+    return refresh_token_of(live) != refresh_token_of(prof)
+
+
+def mark_active(name):
+    set_current(name)
+    meta = load_meta()
+    entry = meta.get(name, {})
+    entry["activated_at"] = time.time()
+    meta[name] = entry
+    save_meta(meta)
+
+
+def running_agy_procs():
+    """How many agy processes are alive. They hold the old login in memory and
+    rewrite the shared token file when their access token refreshes."""
+    try:
+        out = subprocess.run(["pgrep", "-f", r"(^|/)agy( |$)|agy[.]real"],
+                             capture_output=True, text=True).stdout
+        return sum(1 for ln in out.splitlines() if ln.strip())
+    except Exception:
+        return 0
+
+
+def warn_running_agy():
+    n = running_agy_procs()
+    if n:
+        print(f"{YELLOW}note:{RESET} {n} agy session(s) still running with the previous account — "
+              "they keep it until restarted.\n  (their hourly token refresh may briefly overwrite "
+              "the login file; every new agy start auto-corrects back to this account)")
+
+
+def switch_to(name):
+    src = profile_path(name)
+    if not os.path.isfile(src):
+        die(f"no profile '{name}' — profiles: {', '.join(list_profiles()) or '(none)'}")
+    if not valid_token_file(load_json(src)):
+        die(f"profile '{name}' is corrupt or not an agy token file — refusing to switch")
+    try:
+        ensure_fresh_token(src)  # hand agy a fresh access token when possible
+    except Exception:
+        pass  # offline etc. — the stored refresh token is what matters
+    # never lose an unsaved login: auto-backup the live token first
+    if valid_token_file(live_token()):
+        shutil.copyfile(LIVE, profile_path("_last"))
+        os.chmod(profile_path("_last"), 0o600)
+    tmp = f"{LIVE}.tmp.{os.getpid()}"
+    shutil.copyfile(src, tmp)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, LIVE)  # atomic: an interrupt can't truncate the live token
+    mark_active(name)
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_rename(old, new):
+    if not valid_name(new):
+        die("invalid profile name (letters, digits, . _ - only)")
+    src = profile_path(old)
+    if not os.path.isfile(src):
+        die(f"no profile '{old}'")
+    if os.path.exists(profile_path(new)):
+        die(f"profile '{new}' already exists")
+    os.rename(src, profile_path(new))
+    meta = load_meta()
+    if old in meta:
+        meta[new] = meta.pop(old)
+        save_meta(meta)
+    print(f"renamed profile '{old}' → '{new}'")
+
+
+def cmd_use(name):
+    switch_to(name)
+    print(f"switched to '{name}' ({decode_email(live_token())})"
+          " — new agy starts use this account")
+    warn_running_agy()
+
+
+def cmd_logout(name, revoke):
+    """Sign an account out of this machine: delete its profile, drop the live
+    token if it is the active one, and optionally revoke the grant at Google."""
+    if name is None:
+        if not sys.stdin.isatty() or not sys.stdout.isatty():
+            die("usage: agy-switch logout <name> [--revoke]")
+        name = tui("logout")
+        if not name:
+            print("no change")
+            return
+        email = decode_email(load_json(profile_path(name)) or {})
+        verb = f"REVOKE the Google grant for" if revoke else "Log out"
+        try:
+            ans = input(f"{verb} '{name}' ({email})? [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            ans = ""
+        if ans not in ("y", "yes"):
+            print("no change")
+            return
+    tok = load_json(profile_path(name))
+    if not valid_token_file(tok):
+        die(f"no profile '{name}'")
+    email = decode_email(tok)
+    if revoke:
+        body = urllib.parse.urlencode({"token": refresh_token_of(tok)}).encode()
+        try:
+            _json_call(REVOKE_URL, body,
+                       {"Content-Type": "application/x-www-form-urlencoded"})
+        except Exception as e:
+            die(f"revoke failed ({e}) — the grant is still valid, nothing was deleted")
+        print(f"grant revoked at Google for {email}")
+    live = live_token()
+    was_live = valid_token_file(live) and refresh_token_of(live) == refresh_token_of(tok)
+    if was_live:
+        os.remove(LIVE)
+    os.remove(profile_path(name))
+    meta = load_meta()
+    meta.pop(name, None)
+    save_meta(meta)
+    clear_current(name)
+    print(f"logged out '{name}' ({email})", end="")
+    print(", was the live login — next agy run will ask for browser login" if was_live else "")
+    if not revoke:
+        print("the grant is still valid at Google — re-run with --revoke to kill it for real")
+
+
+def cmd_login():
+    """Add an account without losing the current one: stash the live token,
+    run agy so it does its browser OAuth, snapshot whatever it writes."""
+    stash = os.path.join(STORE, ".stash-token")
+    pending = os.path.join(STORE, ".pending-token")
+    for p in (stash, pending):
+        if os.path.exists(p):
+            os.remove(p)
+    os.makedirs(PROFILES, exist_ok=True)
+
+    had_live = valid_token_file(live_token())
+    if had_live:
+        shutil.copyfile(LIVE, profile_path("_last"))  # same auto-backup as `use`
+        os.chmod(profile_path("_last"), 0o600)
+        os.rename(LIVE, stash)
+
+    stop = threading.Event()
+
+    def watch():
+        while not stop.is_set():
+            if valid_token_file(load_json(LIVE)):
+                shutil.copyfile(LIVE, pending)
+                return
+            time.sleep(0.5)
+
+    print("starting agy — log in with the NEW account in the browser.")
+    print("(tip: pick the right Google account in the browser's account chooser)")
+    watcher = threading.Thread(target=watch, daemon=True)
+    watcher.start()
+    try:
+        subprocess.call([AGY_BIN])
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop.set()
+        watcher.join(timeout=2)
+
+    # the poll loop can miss a token written in agy's final moments — check once more
+    if not os.path.isfile(pending) and valid_token_file(load_json(LIVE)):
+        shutil.copyfile(LIVE, pending)
+
+    if os.path.isfile(pending):
+        tok = load_json(pending)
+        email = decode_email(tok)
+        # same grant already saved under a name? just refresh that profile
+        for name in list_profiles():
+            if refresh_token_of(load_json(profile_path(name)) or {}) == refresh_token_of(tok):
+                shutil.copyfile(pending, profile_path(name))
+                os.chmod(profile_path(name), 0o600)
+                mark_active(name)
+                print(f"profile '{name}' updated ({email}) — it is the live login now")
+                break
+        else:
+            default = re.sub(r"[^A-Za-z0-9._-]", "-", email.split("@")[0]) or "account"
+            try:
+                name = input(f"logged in as {email} — save profile as [{default}]: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                name = ""
+            name = name or default
+            if not valid_name(name):
+                name = default
+            base, i = name, 2
+            while os.path.isfile(profile_path(name)):
+                name = f"{base}-{i}"
+                i += 1
+            shutil.copyfile(pending, profile_path(name))
+            os.chmod(profile_path(name), 0o600)
+            mark_active(name)
+            print(f"saved new profile '{name}' ({email}) — it is the live login now")
+        os.remove(pending)
+        if os.path.exists(stash):
+            os.remove(stash)
+        print("run `agy-switch` to pick an account next time")
+    else:
+        if os.path.exists(stash):
+            os.rename(stash, LIVE)
+            print("login not completed — original account restored, nothing changed")
+        else:
+            print("login not completed — no token was written")
+
+
+# ---------------------------------------------------------------- pretty display
+
+BAR_W = 12
+CELL_W = BAR_W + 5   # bar + space + "100%"
+RESET_W = 9          # reserved slot for " ↻4d21h"-style countdowns
+RESET = "\x1b[0m"
+DIM = "\x1b[2m"
+BOLD = "\x1b[1m"
+REV = "\x1b[7m"
+GREEN = "\x1b[32m"
+YELLOW = "\x1b[33m"
+RED = "\x1b[31m"
+GRAY = "\x1b[90m"
+CYAN = "\x1b[36m"
+
+
+def bucket_cell(q, key, reserve=0):
+    """Bar + percentage (+ reset countdown) for one quota bucket.
+    `reserve` pads the cell to a fixed visible width to keep columns aligned."""
+    if q.get(f"{key}_disabled"):
+        return f"{DIM}{'disabled':<{CELL_W + reserve}}{RESET}"
+    frac = q.get(key)
+    if frac is None:
+        return f"{DIM}{'─' * BAR_W + '    —':<{CELL_W + reserve}}{RESET}"
+    frac = max(0.0, min(1.0, frac))
+    filled = round(frac * BAR_W)
+    color = GREEN if frac >= 0.5 else YELLOW if frac >= 0.2 else RED
+    bar = f"{color}{'█' * filled}{GRAY}{'░' * (BAR_W - filled)}{RESET}"
+    pct = f"{round(frac * 100):>3}%"
+    reset = f" ↻{rel_time(parse_ts(q.get(f'{key}_reset')))}" if frac < 0.999 else ""
+    if reserve:
+        reset = reset.ljust(reserve)
+    return f"{bar} {pct}{reset}"
+
+
+def cached_quota(entry):
+    q = (entry or {}).get("quota") or {}
+    return q if q.get("host") == CLOUDCODE else {}
+
+
+def account_data(name, q=None):
+    """(email, tier, quota_dict, last_active) for a profile."""
+    email = decode_email(load_json(profile_path(name)) or {})
+    meta = load_meta().get(name, {})
+    if q is None:
+        q = cached_quota(meta)
+    act = meta.get("activated_at")
+    last = rel_time(datetime.fromtimestamp(act, timezone.utc)) if act else "never"
+    return email, q.get("tier", "?"), q, last
+
+
+def account_block(name, active, q, last, email, cursor=False):
+    """Three display lines for one account."""
+    is_active = name == active
+    dot = f"{GREEN}●{RESET}" if is_active else f"{GRAY}○{RESET}"
+    if is_active:
+        shown_name = f"{BOLD}{GREEN}{name}{RESET}"
+        shown_mail = email
+    else:
+        shown_name = f"{BOLD}{name}{RESET}" if cursor else name
+        shown_mail = f"{GRAY}{email}{RESET}"
+    header = (f" {'❯' if cursor else ' '} {dot} {shown_name} {DIM}·{RESET} {shown_mail} "
+              f"{DIM}·{RESET} {CYAN}{q.get('tier', '?')}{RESET} "
+              f"{DIM}· active {last}{RESET}")
+    lines = [
+        header,
+        f"      {DIM}Gemini{RESET}   5h {bucket_cell(q, 'gemini_5h', RESET_W)}"
+        f"  week {bucket_cell(q, 'gemini_weekly')}",
+        f"      {DIM}Claude{RESET}   5h {bucket_cell(q, 'claude_5h', RESET_W)}"
+        f"  week {bucket_cell(q, 'claude_weekly')}",
+    ]
+    return lines
+
+
+def cmd_ls():
+    names = [n for n in list_profiles() if n != "_last"]
+    if not names:
+        print("no accounts yet — run: agy-switch login")
+        return
+    active = active_profile_name()
+    for n in names:
+        email, _tier, q, last = account_data(n)
+        for line in account_block(n, active, q, last, email):
+            print(line)
+        print()
+    if "_last" in list_profiles():
+        print(f"{DIM}(_last = auto-backup of the login replaced by the last switch){RESET}")
+    if live_was_clobbered():
+        print(f"{YELLOW}⚠ the live login was overwritten by a still-running agy of another account;\n"
+              f"  the next agy start auto-corrects back to '{get_current()}'{RESET}")
+    print(f"{DIM}quota shown from cache; the interactive list refreshes it live{RESET}")
+
+
+# ---------------------------------------------------------------- TUI
+
+ESC = "\x1b"
+
+
+def read_term_key(fd):
+    """One keypress from a raw-mode terminal. Arrows -> 'up'/'down', Enter ->
+    'enter', bare Esc -> 'esc'. Waits up to 150ms for the rest of an escape
+    sequence — tmux/ssh/multiplexers can split the ESC [ A bytes apart, and a
+    short one-shot read would mistake an arrow key for a bare Esc."""
+    ch = os.read(fd, 1)
+    if ch != b"\x1b":
+        if ch in (b"\r", b"\n"):
+            return "enter"
+        return ch.decode(errors="ignore")
+    seq = b""
+    end = time.time() + 0.15
+    while len(seq) < 2:
+        r, _, _ = select.select([fd], [], [], max(0, end - time.time()))
+        if not r:
+            break
+        seq += os.read(fd, 2 - len(seq))
+    if not seq:
+        return "esc"
+    return {b"[A": "up", b"[B": "down", b"OA": "up", b"OB": "down"}.get(seq[:2], "esc")
+
+
+def tui(action="switch"):
+    """Interactive account picker ('switch' or 'logout'). Returns the chosen
+    profile name, or None if the user bailed."""
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        die("interactive mode needs a terminal — use 'agy-switch ls' / 'agy-switch use <name>'")
+    names = [n for n in list_profiles() if n != "_last"]
+    if not names:
+        die("no accounts yet — run: agy-switch login")
+
+    active = active_profile_name()
+    state = {
+        "sel": names.index(active) if active in names else 0,  # cursor on current account
+        "quota": {n: cached_quota(load_meta().get(n, {})) for n in names},
+        "stale": set(),
+        "switched": None,
+    }
+    lock = threading.Lock()
+
+    def refresh_worker(name, force):
+        q, fresh = quota_for_profile(name, force=force)
+        with lock:
+            if q:
+                state["quota"][name] = q
+            if not fresh:
+                state["stale"].add(name)
+            else:
+                state["stale"].discard(name)
+
+    def kick_refresh(force=False):
+        for n in names:
+            threading.Thread(target=refresh_worker, args=(n, force), daemon=True).start()
+
+    if action == "switch":
+        kick_refresh()  # quota is irrelevant when picking an account to log out
+
+    # static row data: only quota changes while the TUI is open
+    meta = load_meta()
+    static = {}
+    for n in names:
+        email = decode_email(load_json(profile_path(n)) or {})
+        act = meta.get(n, {}).get("activated_at")
+        last = rel_time(datetime.fromtimestamp(act, timezone.utc)) if act else "never"
+        static[n] = (email, last)
+
+    def render():
+        with lock:
+            quotas = {k: dict(v) for k, v in state["quota"].items()}
+            stale = set(state["stale"])
+            sel = state["sel"]
+        out = [f"{ESC}[H{ESC}[2J"]  # home + clear
+        hints = ("↑/↓ move · Enter switch · r refresh quota · q quit" if action == "switch"
+                 else "↑/↓ move · Enter select · q quit")
+        out.append(f"{ESC}[1m agy-switch{ESC}[0m  {ESC}[2m{hints}{ESC}[0m\r\n\r\n")
+        for idx, n in enumerate(names):
+            email, last = static[n]
+            q = quotas.get(n) or {}
+            lines = account_block(n, active, q, last, email, cursor=(idx == sel))
+            if idx == sel:
+                # reverse-video the header, keeping inner colors alive
+                lines[0] = REV + lines[0].replace(RESET, RESET + REV) + RESET
+            out.append("\r\n".join(lines) + "\r\n\r\n")
+        if stale:
+            out.append(f"{DIM}(quota for {', '.join(sorted(stale))} "
+                       f"could not be refreshed — showing cached values){RESET}\r\n")
+        sys.stdout.write("".join(out))
+        sys.stdout.flush()
+
+    import termios
+    import tty
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        sys.stdout.write(f"{ESC}[?1049h{ESC}[?25l")  # alt screen, hide cursor
+        render()
+        while True:
+            r, _, _ = select.select([sys.stdin], [], [], 0.5)
+            if not r:
+                render()  # pick up background quota refreshes
+                continue
+            k = read_term_key(fd)
+            if k == "up":
+                state["sel"] = (state["sel"] - 1) % len(names)
+            elif k == "down":
+                state["sel"] = (state["sel"] + 1) % len(names)
+            elif k == "esc":
+                break
+            elif k in ("q", "Q", "\x03"):
+                break
+            elif k in ("j",):
+                state["sel"] = (state["sel"] + 1) % len(names)
+            elif k in ("k",):
+                state["sel"] = (state["sel"] - 1) % len(names)
+            elif k in ("r", "R") and action == "switch":
+                kick_refresh(force=True)
+            elif k == "enter":
+                state["switched"] = names[state["sel"]]
+                break
+            render()
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        sys.stdout.write(f"{ESC}[?25h{ESC}[?1049l")  # show cursor, leave alt screen
+        sys.stdout.flush()
+
+    return state["switched"]
+
+
+# ---------------------------------------------------------------- proxy
+
+SHIM_MARKER = "agy-switch proxy shim"
+
+SHIM_TEMPLATE = r"""#!/bin/bash
+# @MARKER@ — managed by `agy-switch proxy`; the real binary is @REAL@
+REAL=@REAL@
+ENV="$HOME/.local/share/agy-switch/proxy.env"
+USE=0
+AGY_SET=""
+if [ -f "$ENV" ]; then
+  . "$ENV"
+  USE=${AGY_PROXY_ENABLED:-0}
+  if [ "$USE" = "1" ] && [ -n "${AGY_PROXY_EXPIRES:-}" ] && [ "$(date +%s)" -ge "$AGY_PROXY_EXPIRES" ]; then
+    if [ "${AGY_PROXY_FALLBACK:-0}" = "1" ]; then
+      echo "agy-switch: proxy expired — falling back to a DIRECT connection" >&2
+      USE=0
+    else
+      echo "agy-switch: proxy expired and fallback is off — refusing to run agy" >&2
+      echo "  update it with 'agy-switch proxy' or disable with 'agy-switch proxy off'" >&2
+      exit 1
+    fi
+  fi
+fi
+if [ "$USE" != "1" ]; then
+  for v in $AGY_SET; do unset "$v"; done
+fi
+
+# network quality probe: reachability + exit-IP region (cached: 6h after a good
+# result, 10min after a bad one, so normal starts cost nothing). Results are only
+# reused for the same path tag (P:host:port vs D) — toggling the proxy re-probes.
+# cache format: "epoch state cc tag" — state 0=blocked 1=ok 2=unsupported region
+TAG="D"
+if [ "$USE" = "1" ]; then
+  TAG="P:$(printf '%s' "${HTTPS_PROXY:-${https_proxy:-}}" | sed 's|^[a-zA-Z]*://||; s|.*@||; s|/.*||')"
+fi
+CK="$HOME/.local/share/agy-switch/.netcheck"
+LAST=0; OK=1; CC=""; CTAG=""
+[ -f "$CK" ] && read -r LAST OK CC CTAG < "$CK"
+TTL=600; [ "$OK" = "1" ] && TTL=21600
+if { [ $(( $(date +%s) - ${LAST:-0} )) -ge "$TTL" ] || [ "$CTAG" != "$TAG" ]; } && command -v curl >/dev/null 2>&1; then
+  if curl -s --max-time 3 -o /dev/null https://daily-cloudcode-pa.googleapis.com; then
+    OK=1
+    CC=$(curl -s --max-time 3 "${AGY_SWITCH_GEO_URL:-https://api.country.is}" \
+         | sed -n 's/.*"country"[: ]*"\([A-Za-z][A-Za-z]\)".*/\1/p' | head -1 | tr 'a-z' 'A-Z')
+    case " CN HK MO RU BY IR KP CU SY " in *" $CC "*) OK=2;; esac
+    echo "$(date +%s) $OK ${CC:--} $TAG" > "$CK"
+  else
+    OK=0
+    echo "$(date +%s) 0 - $TAG" > "$CK"
+  fi
+  if [ "$OK" = "0" ]; then
+    echo "agy-switch: cannot reach Google's API from this network — agy may fail" >&2
+    echo "  or report 'region not supported'. Fix: agy-switch proxy" >&2
+  elif [ "$OK" = "2" ]; then
+    echo "agy-switch: your current IP region (${CC:-?}) is not supported by Google AI —" >&2
+    echo "  agy will report 'region not supported'. Fix: agy-switch proxy" >&2
+    echo "  (route through a supported region such as JP/SG/US)" >&2
+  fi
+fi
+# re-assert the account picked via agy-switch: a still-running agy of another
+# account rewrites the shared token file when its access token refreshes
+# (hourly), which would otherwise silently revert the login. Skip when the live
+# token already carries the same refresh token (same account, possibly fresher).
+CUR="$HOME/.local/share/agy-switch/current"
+TOK="$HOME/.gemini/antigravity-cli/antigravity-oauth-token"
+if [ -f "$CUR" ]; then
+  P=$(head -c 64 "$CUR" 2>/dev/null)
+  case "$P" in
+    ""|*[!A-Za-z0-9._-]*) : ;;
+    *)
+      SRC="$HOME/.local/share/agy-switch/profiles/$P.json"
+      if [ -f "$SRC" ]; then
+        RT_S=$(grep -o '"refresh_token"[: ]*"[^"]*"' "$SRC" 2>/dev/null | head -1)
+        RT_L=$(grep -o '"refresh_token"[: ]*"[^"]*"' "$TOK" 2>/dev/null | head -1)
+        if [ -n "$RT_S" ] && [ "$RT_S" != "$RT_L" ]; then
+          cp "$SRC" "$TOK.tmp.$$" 2>/dev/null && chmod 600 "$TOK.tmp.$$" && mv -f "$TOK.tmp.$$" "$TOK"
+        fi
+      fi
+      ;;
+  esac
+fi
+exec "$REAL" "$@"
+"""
+
+
+def parse_validity(s):
+    """'30d' / '12h' / '90m' / '2026-10-01' / '2026-10-01 08:00' / '' -> epoch | None."""
+    s = (s or "").strip()
+    if not s:
+        return None
+    m = re.fullmatch(r"(\d+)\s*([dhm])", s, re.I)
+    if m:
+        mult = {"d": 86400, "h": 3600, "m": 60}[m.group(2).lower()]
+        return time.time() + int(m.group(1)) * mult
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
+        s += " 23:59:59"  # "valid until <date>" means through that day
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        raise ValueError(f"cannot parse '{s}' — use 30d / 12h / YYYY-MM-DD")
+    if dt.tzinfo is None:
+        dt = dt.astimezone()  # naive means local time
+    return dt.timestamp()
+
+
+def proxy_url(cfg, mask=False):
+    auth = ""
+    if cfg.get("username"):
+        if mask:
+            u = cfg["username"]
+            # some providers reuse the secret as the username — never echo it whole
+            auth = (u[:2] + "****" if len(u) > 2 else "****") + ":****@"
+        else:
+            auth = (urllib.parse.quote(cfg["username"], safe="") + ":"
+                    + urllib.parse.quote(cfg.get("password", ""), safe="") + "@")
+    return f"{cfg.get('protocol', 'http')}://{auth}{cfg.get('host')}:{cfg.get('port')}"
+
+
+PROXY_FIELDS = ("protocol", "host", "port", "username", "password",
+                "expires_at", "fallback")
+
+
+def load_proxy_db():
+    """Multi-proxy store: {version:2, active: name|None, shim_path, real_path,
+    proxies: {name: {protocol,host,port,username,password,expires_at,fallback,check}}}.
+    Migrates the original single-proxy flat format on first read."""
+    d = load_json(PROXY_FILE) or {}
+    if d.get("version") == 2:
+        return d
+    db = {"version": 2, "active": None, "proxies": {}}
+    for k in ("shim_path", "real_path"):
+        if d.get(k):
+            db[k] = d[k]
+    if d.get("host"):
+        name = d.get("name") or d["host"]
+        db["proxies"][name] = {k: d[k] for k in PROXY_FIELDS if k in d}
+        if d.get("enabled", True):
+            db["active"] = name
+        write_json_atomic(PROXY_FILE, db)  # persist the migration once
+    return db
+
+
+def save_proxy_db(db):
+    write_json_atomic(PROXY_FILE, db)
+
+
+def proxy_state(cfg):
+    """Expiry state of a proxy: 'on' | 'expired_fallback' | 'expired_block'."""
+    exp = cfg.get("expires_at")
+    if exp and time.time() >= exp:
+        return "expired_fallback" if cfg.get("fallback") else "expired_block"
+    return "on"
+
+
+def active_proxy(db=None):
+    """(name, cfg, state) of the enabled proxy; (None, None, 'off') when direct."""
+    db = db if db is not None else load_proxy_db()
+    name = db.get("active")
+    cfg = db.get("proxies", {}).get(name) if name else None
+    if not cfg:
+        return None, None, "off"
+    return name, cfg, proxy_state(cfg)
+
+
+def write_proxy_env(db=None):
+    db = db if db is not None else load_proxy_db()
+    name, cfg, _ = active_proxy(db)
+    enabled = cfg is not None  # expiry is decided by the shim at agy start
+    lines = [
+        "# generated by agy-switch — do not edit",
+        f"AGY_PROXY_ENABLED={1 if enabled else 0}",
+        f"AGY_PROXY_EXPIRES={int(cfg['expires_at']) if cfg and cfg.get('expires_at') else ''}",
+        f"AGY_PROXY_FALLBACK={1 if cfg and cfg.get('fallback') else 0}",
+    ]
+    url = proxy_url(cfg) if cfg else ""
+    lines.append("AGY_SET=")
+    lines.append('if [ "${AGY_PROXY_ENABLED:-0}" = "1" ]; then')
+    # env the user already exported (e.g. from ~/.bashrc) wins — we only fill gaps,
+    # and AGY_SET tracks which variables are ours so a fallback can unset them
+    for var in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+                "http_proxy", "https_proxy", "all_proxy"):
+        lines.append(f'  [ -z "${{{var}+x}}" ] && {{ export {var}={shlex.quote(url)};'
+                     f' AGY_SET="$AGY_SET {var}"; }}')
+    # agy's OAuth login callback listens on localhost — never proxy that
+    for var in ("NO_PROXY", "no_proxy"):
+        lines.append(f"  export {var}=localhost,127.0.0.1,::1")
+    lines.append("fi")
+    os.makedirs(STORE, exist_ok=True)
+    tmp = f"{PROXY_ENV}.tmp.{os.getpid()}"
+    with open(tmp, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, PROXY_ENV)
+
+
+def is_shim(path):
+    try:
+        if os.path.getsize(path) > 1024 * 1024:
+            return False
+        with open(path, "rb") as f:
+            return SHIM_MARKER.encode() in f.read(512)
+    except OSError:
+        return False
+
+
+def install_shim(cfg):
+    """Put the proxy shim where `agy` lives, moving the real binary to agy.real.
+    Also repairs the shim after `agy update` replaces it. Returns cfg or None."""
+    shim = cfg.get("shim_path")
+    real = cfg.get("real_path")
+    if not shim:
+        shim = shutil.which("agy")
+        if not shim:
+            return None
+        real = shim + ".real"
+    if is_shim(shim) and os.path.isfile(real):
+        pass  # already installed
+    elif os.path.isfile(shim):
+        os.rename(shim, real)  # the binary currently at the shim path is real
+    elif not os.path.isfile(real):
+        return None  # neither shim nor real binary — agy not installed here?
+    tmp = f"{shim}.tmp.{os.getpid()}"
+    with open(tmp, "w") as f:
+        f.write(SHIM_TEMPLATE.replace("@MARKER@", SHIM_MARKER)
+                             .replace("@REAL@", shlex.quote(real)))
+    os.chmod(tmp, 0o755)
+    os.replace(tmp, shim)
+    cfg["shim_path"], cfg["real_path"] = shim, real
+    return cfg
+
+
+def apply_proxy_to_self():
+    """Route this tool's own Google calls (quota, refresh, revoke) too."""
+    name, cfg, state = active_proxy()
+    if state != "on":
+        return  # off or expired — stay direct so the tool itself keeps working
+    url = proxy_url(cfg)
+    for var in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+                "http_proxy", "https_proxy", "all_proxy"):
+        os.environ[var] = url
+    os.environ["NO_PROXY"] = os.environ["no_proxy"] = "localhost,127.0.0.1,::1"
+
+
+GEO_URL = os.environ.get("AGY_SWITCH_GEO_URL", "https://api.country.is")
+# Google AI / Antigravity unsupported regions (IP-based): mainland China, Hong Kong,
+# Macau + embargoed countries. Editable — Google's list changes over time.
+UNSUPPORTED_REGIONS = {"CN", "HK", "MO", "RU", "BY", "IR", "KP", "CU", "SY"}
+
+
+def net_tag():
+    """Which network path will agy take right now? 'P:host:port' via the active
+    proxy, or 'D' for direct. Cached probe results are only valid for the same path."""
+    name, cfg, state = active_proxy()
+    if state == "on":
+        return f"P:{cfg.get('host')}:{cfg.get('port')}"
+    return "D"
+
+
+def net_ok():
+    """Network quality for agy: (state, country_code).
+    state is 'ok' | 'blocked' (API unreachable) | 'region' (IP in unsupported region).
+    Cached in .netcheck ('epoch state cc path-tag'), shared with the agy shim:
+    6h after ok, 10min after a bad result, and only reused for the same path tag —
+    toggling the proxy forces a fresh probe. When a proxy is enabled, the probe
+    goes through it (the path agy will actually use)."""
+    tag = net_tag()
+    try:
+        last, state, cc, ctag = (open(NETCHECK).read().split() + ["", "", "", ""])[:4]
+        ttl = 21600 if state == "1" else 600
+        if ctag == tag and time.time() - float(last) < ttl:
+            return {"0": "blocked", "1": "ok"}.get(state, "region"), cc
+    except (OSError, ValueError):
+        pass
+    # probe through the same path agy will take: the configured proxy when enabled
+    # (via curl — urllib can't do https:// or socks proxies), else direct.
+    px = []
+    _pn, pcfg, _ps = active_proxy()
+    if tag.startswith("P:") and pcfg and shutil.which("curl"):
+        px = ["-x", proxy_url(pcfg)]
+    def get(url):
+        if px:
+            r = subprocess.run(["curl", "-s", "--max-time", "3"] + px + [url],
+                               capture_output=True, text=True)
+            return r.stdout if r.returncode in (0,) or r.stdout else None
+        try:
+            return opener_direct().open(url, timeout=3).read().decode()
+        except urllib.error.HTTPError as e:  # any HTTP response = reachable
+            return str(e.code)
+        except Exception:
+            return None
+    def opener_direct():
+        return urllib.request.build_opener()
+    state, cc = 1, ""
+    if get("https://daily-cloudcode-pa.googleapis.com") is None:
+        state = 0
+    if state == 1:
+        try:
+            body = get(GEO_URL)
+            cc = (json.loads(body).get("country") or "").upper() if body else ""
+            if cc in UNSUPPORTED_REGIONS:
+                state = 2
+        except Exception:
+            pass  # no geo data — no opinion, treat as ok
+    try:
+        os.makedirs(STORE, exist_ok=True)
+        with open(NETCHECK, "w") as f:
+            f.write(f"{int(time.time())} {state} {cc or '-'} {tag}")
+    except OSError:
+        pass
+    return {0: "blocked", 1: "ok"}.get(state, "region"), cc
+
+
+def proxy_from_env():
+    """Parse an existing HTTPS_PROXY-style URL from the (pre-injection) environment."""
+    m = re.fullmatch(r"(?:(\w+)://)?(?:([^:@/]+)(?::([^@/]*))?@)?([^:/]+):(\d+)/?",
+                     ENV_PROXY_URL)
+    if not m:
+        return {}
+    proto, user, pw, host, port = m.groups()
+    return {"protocol": proto or "http", "host": host, "port": port,
+            "username": urllib.parse.unquote(user or ""),
+            "password": urllib.parse.unquote(pw or "")}
+
+
+def tcp_test(host, port, timeout=5):
+    import socket
+    try:
+        with socket.create_connection((host, int(port)), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+AGY_ENDPOINT = os.environ.get(
+    "AGY_SWITCH_ENDPOINT", "https://daily-cloudcode-pa.googleapis.com")
+
+
+def http_test(url, timeout=8):
+    """HTTPS GET through the proxy URL to agy's real endpoint — that is the
+    traffic we care about; a generic target like www.google.com can be
+    allowlisted by local network filters and make a useless proxy look alive.
+    Prefer curl: urllib can only do plain http:// proxies, while curl handles
+    https:// (TLS to the proxy) and socks too. Any HTTP status counts as ok —
+    curl exits 0 once the tunnel+TLS+HTTP round trip completes."""
+    if shutil.which("curl"):
+        return subprocess.call(
+            ["curl", "-s", "--max-time", str(timeout), "-o", "/dev/null",
+             "-x", url, AGY_ENDPOINT],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0
+    try:
+        op = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": url, "https": url}))
+        op.open(AGY_ENDPOINT, timeout=timeout)
+        return True
+    except urllib.error.HTTPError:
+        return True  # got an HTTP response — the tunnel works
+    except Exception:
+        return False
+
+
+IPAPI_URL = os.environ.get("AGY_SWITCH_IPAPI_URL",
+    "http://ip-api.com/json/?fields=status,country,countryCode,city,isp,org,proxy,hosting,mobile,query")
+IPWHOIS_URL = os.environ.get("AGY_SWITCH_IPWHOIS_URL", "https://ipwho.is/")
+PROBE_TTL = 600  # per-proxy probe cache (seconds)
+
+HOSTING_ASNS = {15169, 16509, 8075, 13335, 14061, 45102, 132203, 31898,
+                24940, 16276, 20473, 63949}  # Google AWS MS CF DO Ali Tencent Oracle Hetzner OVH Vultr Linode
+
+
+def _parse_ipapi(text):
+    j = json.loads(text)
+    if j.get("status") != "success":
+        return None
+    kind = ("hosting" if j.get("hosting") else
+            "mobile" if j.get("mobile") else
+            "proxy/VPN" if j.get("proxy") else "residential/ISP")
+    return {"exit_ip": j.get("query"), "cc": (j.get("countryCode") or "").upper(),
+            "city": j.get("city") or "", "isp": j.get("isp") or j.get("org") or "",
+            "kind": kind}
+
+
+def _parse_ipwhois(text):
+    j = json.loads(text)
+    if not j.get("success"):
+        return None
+    conn = j.get("connection") or {}
+    kind = "hosting" if conn.get("asn") in HOSTING_ASNS else ""
+    return {"exit_ip": j.get("ip"), "cc": (j.get("country_code") or "").upper(),
+            "city": j.get("city") or "", "isp": conn.get("isp") or conn.get("org") or "",
+            "kind": kind}
+
+
+def probe_proxy(cfg, timeout=6):
+    """Probe a proxy: tcp reachability, then ONE tunneled HTTPS request to agy's
+    endpoint (the traffic we actually care about), then geo/classify the exit
+    IP — ip-api over plain http first (richer: proxy/hosting flags), ipwho.is
+    over https as fallback. Returns {at, ok, err?, exit_ip?, cc?, city?, ...}."""
+    out = {"at": time.time(), "ok": False}
+    if not tcp_test(cfg["host"], cfg["port"], timeout=3):
+        out["err"] = f"tcp {cfg['host']}:{cfg['port']} unreachable"
+        return out
+    if not shutil.which("curl"):
+        out["err"] = "curl not found"
+        return out
+    px = proxy_url(cfg)
+    if subprocess.call(["curl", "-s", "--max-time", str(timeout), "-o", "/dev/null",
+                        "-x", px, AGY_ENDPOINT],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) != 0:
+        out["err"] = "cannot tunnel to googleapis — dead proxy, wrong protocol, or blocked by the local network"
+        return out
+    out["ok"] = True
+    for url, parse in ((IPAPI_URL, _parse_ipapi), (IPWHOIS_URL, _parse_ipwhois)):
+        try:
+            r = subprocess.run(["curl", "-s", "--max-time", str(timeout),
+                                "-x", px, url], capture_output=True, text=True)
+            geo = parse(r.stdout)
+            if geo:
+                out.update(geo)
+                break
+        except Exception:
+            pass
+    return out
+
+
+def detect_protocol(cfg, timeout=6):
+    """Race https/http/socks5h in parallel through the given server; return the
+    first scheme that tunnels HTTPS, or None. Saves users from knowing whether
+    their provider is a plain-HTTP or TLS ('tls: true') proxy."""
+    ok = {}
+
+    def trial(p):
+        if http_test(proxy_url({**cfg, "protocol": p}), timeout=timeout):
+            ok[p] = True
+
+    threads = [threading.Thread(target=trial, args=(p,), daemon=True)
+               for p in ("https", "socks5h", "http")]
+    for t in threads:
+        t.start()
+    deadline = time.time() + timeout + 1
+    for t in threads:
+        t.join(max(0, deadline - time.time()))
+    # preference: https (TLS hides the CONNECT targets from local DPI) >
+    # socks5h (binary protocol, slips past HTTP-proxy app filters) >
+    # http (plaintext CONNECT, the easiest to block)
+    for p in ("https", "socks5h", "http"):
+        if ok.get(p):
+            return p
+    return None
+
+
+WIZ_TOTAL = 7
+
+
+def proxy_wizard(db, cfg=None):
+    """Sequential add-proxy flow (prefilled from the environment when possible).
+    Saves into the multi-proxy db and enables the new entry."""
+    if not sys.stdin.isatty():
+        die("proxy setup needs a terminal")
+    if not cfg:
+        cfg = proxy_from_env()
+        detected = bool(cfg)
+    else:
+        detected = False
+
+    W = 58
+    print(f"{CYAN}╭{'─' * (W - 2)}╮{RESET}")
+    print(f"{CYAN}│{RESET}{BOLD}{'agy-switch proxy setup':^{W - 2}}{RESET}{CYAN}│{RESET}")
+    print(f"{CYAN}│{RESET}{DIM}{'empty input keeps [current] · Ctrl-C cancels':^{W - 2}}{RESET}{CYAN}│{RESET}")
+    print(f"{CYAN}╰{'─' * (W - 2)}╯{RESET}")
+    if detected:
+        print(f" {GREEN}✓{RESET} detected proxy in your environment: "
+              f"{BOLD}{proxy_url(cfg, mask=True)}{RESET} — prefilled below")
+    if ENV_PROXY_URL:
+        print(f" {DIM}note: your shell already exports a proxy — it wins; this config\n"
+              f"   fills the gaps (non-interactive shells, IDEs, other machines){RESET}")
+    print()
+
+    def ask(step, label, key, default="", secret=False):
+        cur = cfg.get(key, default)
+        shown = "****" if (secret and cur) else cur
+        hint = f" {DIM}[{shown}]{RESET}" if shown not in (None, "") else ""
+        prompt = f" {DIM}{step}/{WIZ_TOTAL}{RESET} {BOLD}{label}{RESET}{hint} {CYAN}❯{RESET} "
+        val = (getpass.getpass(prompt) if secret else input(prompt)).strip()
+        return val if val else cur
+
+    try:
+        cfg["host"] = ask(1, "server", "host", "127.0.0.1")
+        if not cfg["host"]:
+            die("server is required")
+        cfg["name"] = cfg["host"]  # rename later with R in the manager
+        while True:
+            try:
+                cfg["port"] = int(ask(2, "port", "port", "7890"))
+                if not 1 <= cfg["port"] <= 65535:
+                    raise ValueError
+                break
+            except ValueError:
+                print(f"   {YELLOW}port must be a number between 1 and 65535{RESET}")
+        cfg["username"] = ask(3, "username (empty = no auth)", "username", "")
+        cfg["password"] = ask(4, "password", "password", "", secret=True)
+        while True:
+            proto = (ask(5, "protocol (empty = auto-detect)", "protocol", "") or "").lower()
+            if proto in ("", "auto"):
+                print(f"  {DIM}detecting protocol (racing https / socks5h / http)…{RESET}",
+                      flush=True)
+                proto = detect_protocol(cfg) or ""
+                if proto:
+                    print(f"  {GREEN}✓{RESET} auto-detected: {BOLD}{proto}{RESET}")
+                else:
+                    print(f"  {YELLOW}auto-detect failed — type one manually{RESET}")
+                    continue
+                break
+            if proto in ("http", "https", "socks5", "socks5h"):
+                break
+            print(f"   {YELLOW}unknown protocol — http, https, socks5, socks5h or empty{RESET}")
+        cfg["protocol"] = proto
+        while True:
+            try:
+                cur_exp = cfg.get("expires_at")
+                cur_v = ("" if not cur_exp else
+                         datetime.fromtimestamp(cur_exp).strftime("%Y-%m-%d"))
+                v = ask(6, "validity (30d / 12h / 2026-10-01, empty = never)", "_v", cur_v)
+                cfg["expires_at"] = (None if str(v).strip().lower() in ("", "never", "none", "-")
+                                     else parse_validity(v))
+                break
+            except ValueError as e:
+                print(f"   {YELLOW}{e}{RESET}")
+        fb = ask(7, "fall back to DIRECT when expired? (y/N)", "_fb", "")
+        cfg["fallback"] = str(fb).lower() in ("y", "yes")
+    except (KeyboardInterrupt, EOFError):
+        print(f"\n {YELLOW}cancelled — nothing changed{RESET}")
+        return
+
+    # duplicate guard: another entry already pointing at the same server:port —
+    # offer to update it (keeping its name) instead of adding a parallel entry
+    dupes = [n for n, c in db.get("proxies", {}).items()
+             if n != cfg["name"] and c.get("host") == cfg["host"]
+             and str(c.get("port")) == str(cfg["port"])]
+    if dupes:
+        try:
+            ans = input(f" {YELLOW}note:{RESET} '{dupes[0]}' already points to this server — "
+                        f"update it in place (keeping the name)? {DIM}[Y/n]{RESET} "
+                        ).strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            ans = "y"
+        if ans not in ("n", "no"):
+            cfg["name"] = dupes[0]
+
+    exp = cfg.get("expires_at")
+    exp_s = ("never" if not exp else
+             datetime.fromtimestamp(exp).strftime("%Y-%m-%d %H:%M"))
+    print(f"\n {BOLD}summary{RESET}")
+    for k, v in [
+        ("name", cfg["name"]),
+        ("proxy", proxy_url(cfg, mask=True)),
+        ("auth", (cfg["username"][:2] + "****" if len(cfg.get("username", "")) > 2
+                  else "****" if cfg.get("username") else "none")),
+        ("expires", exp_s),
+        ("on expiry", "fall back to direct" if cfg["fallback"] else "refuse to run agy"),
+    ]:
+        print(f"   {DIM}{k:<10}{RESET} {v}")
+    try:
+        ok = input(f"\n save and enable? {DIM}[Y/n]{RESET} ").strip().lower()
+    except (KeyboardInterrupt, EOFError):
+        ok = "n"
+    if ok in ("n", "no"):
+        print("cancelled — nothing changed")
+        return
+
+    name = cfg["name"]
+    replaced = name in db.setdefault("proxies", {})
+    db["proxies"][name] = {k: cfg[k] for k in PROXY_FIELDS if k in cfg}
+    db["active"] = name
+    db2 = install_shim(db)
+    if db2 is None:
+        die("agy not found on PATH — is it installed?")
+    db = db2
+    write_proxy_env(db)
+    save_proxy_db(db)
+
+    print(f"\n {GREEN}✓{RESET} proxy '{name}' {'replaced' if replaced else 'saved'} and ENABLED")
+    print(f"   shim: {db['shim_path']} (real binary: {db['real_path']})")
+    print("   every `agy` run now goes through this proxy automatically")
+    if tcp_test(cfg["host"], cfg["port"]):
+        line = f" {GREEN}✓{RESET} tcp {cfg['host']}:{cfg['port']} reachable"
+        if cfg["protocol"] in ("http", "https"):
+            if http_test(proxy_url(cfg)):
+                line += f"  {GREEN}✓{RESET} https through proxy"
+            else:
+                line += f"  {RED}✗ https through proxy FAILED{RESET}"
+                if cfg["protocol"] == "http":
+                    line += (f"\n   {YELLOW}hint: if your provider config says tls: true, "
+                             f"this is an HTTPS proxy — re-run and pick protocol https{RESET}")
+        print(line)
+    else:
+        print(f" {YELLOW}⚠{RESET} cannot reach {cfg['host']}:{cfg['port']} — saved anyway")
+
+
+def expiry_text(cfg):
+    exp = cfg.get("expires_at")
+    if not exp:
+        return "never"
+    dt = datetime.fromtimestamp(exp, timezone.utc)
+    return (f"expired {rel_time(dt)}" if time.time() >= exp else f"in {rel_time(dt)}")
+
+
+def proxy_status(db):
+    proxies = db.get("proxies", {})
+    if not proxies:
+        print("no proxy configured — run: agy-switch proxy")
+        return
+    for name, cfg in proxies.items():
+        state = proxy_state(cfg)
+        tags = []
+        if db.get("active") == name:
+            tags.append("ACTIVE" + ("" if state == "on" else
+                        " but EXPIRED — " + ("falls back to direct" if state == "expired_fallback"
+                                             else "agy will refuse to run")))
+        else:
+            tags.append("off")
+        chk = cfg.get("check") or {}
+        if chk.get("ok") and chk.get("cc"):
+            seen = f"{chk['cc']} {chk.get('city', '')} · {chk.get('kind') or '?'} · {chk.get('isp', '')}"
+        elif chk.get("ok"):
+            seen = "tunnel ok · exit geo unknown"
+        elif chk.get("err"):
+            seen = f"unreachable — {chk['err']}"
+        else:
+            seen = ""
+        print(f"{'●' if db.get('active') == name else '○'} {name}: {proxy_url(cfg, mask=True)}")
+        print(f"  state: {', '.join(tags)}; expires: {expiry_text(cfg)}"
+              + (f"\n  exit: {seen}" if seen else ""))
+    shim = db.get("shim_path", "")
+    print(f"shim: {'installed at ' + shim if shim and is_shim(shim) else 'NOT active'}")
+    net, cc = net_ok()
+    net_s = {"ok": f"{GREEN}ok{RESET}" + (f" (exit region: {cc})" if cc else ""),
+             "blocked": f"{RED}Google API unreachable{RESET}",
+             "region": f"{RED}IP region {cc or '?'} not supported by Google AI{RESET}"}[net]
+    print(f"network: {net_s}")
+
+
+def enable_proxy(db, name=None):
+    proxies = db.get("proxies", {})
+    if not proxies:
+        die("no proxy configured yet — run: agy-switch proxy")
+    name = name or db.get("active") or (next(iter(proxies)) if len(proxies) == 1 else None)
+    if not name:
+        die("more than one proxy — pick one: agy-switch proxy on <name>\n"
+            "  " + ", ".join(proxies))
+    if name not in proxies:
+        die(f"no proxy '{name}' — have: {', '.join(proxies)}")
+    db["active"] = name
+    db2 = install_shim(db)
+    if db2 is None:
+        die("agy not found on PATH — is it installed?")
+    db = db2
+    write_proxy_env(db)
+    save_proxy_db(db)
+    cfg = proxies[name]
+    warn = "" if proxy_state(cfg) == "on" else f" {YELLOW}(expired!){RESET}"
+    print(f"proxy on ({name}: {proxy_url(cfg, mask=True)}){warn}")
+
+
+def cmd_proxy(args):
+    db = load_proxy_db()
+    action = args[0] if args else None
+    if action is None:
+        if sys.stdin.isatty() and sys.stdout.isatty():
+            proxy_manager()
+        else:
+            proxy_status(db)
+    elif action in ("set", "add"):
+        proxy_wizard(db)
+    elif action == "on":
+        enable_proxy(db, args[1] if len(args) > 1 else None)
+    elif action == "off":
+        db["active"] = None
+        write_proxy_env(db)
+        save_proxy_db(db)
+        print("proxy off — agy now runs direct")
+    elif action == "status":
+        proxy_status(db)
+    else:
+        die("usage: agy-switch proxy [on [name]|off|status|add]  (no argument: manager)")
+
+
+def proxy_manager():
+    """Interactive proxy manager: list with live probes, Enter toggles the active
+    proxy, a add (wizard), e per-field edit, d delete, r re-probe, q quit."""
+    db = load_proxy_db()
+    state = {"sel": 0, "msg": "", "confirm": None, "probing": set(), "exit_msg": None,
+             "checks": {n: c["check"] for n, c in db.get("proxies", {}).items()
+                        if c.get("check")}}
+    lock = threading.Lock()
+
+    def names():
+        return list(db.get("proxies", {}))
+
+    def probe_worker(n):
+        cfg = db.get("proxies", {}).get(n)
+        if not cfg:
+            return
+        chk = probe_proxy(cfg)
+        with lock:
+            state["checks"][n] = chk
+            if n in db.get("proxies", {}):
+                db["proxies"][n]["check"] = chk
+            state["probing"].discard(n)
+            if not state["probing"]:
+                state["msg"] = f"{GREEN}✓{RESET} probes updated"
+
+    def kick_probes(force=False):
+        todo = []
+        for n in names():
+            old = state["checks"].get(n)
+            if not force and old and time.time() - old.get("at", 0) < PROBE_TTL:
+                continue
+            todo.append(n)
+        with lock:
+            state["probing"] |= set(todo)
+        for n in todo:
+            threading.Thread(target=probe_worker, args=(n,), daemon=True).start()
+
+    import termios
+    import tty
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+
+    def read_key():
+        return read_term_key(fd)
+
+    def line_input(prompt, secret=False):
+        """One cooked-mode input line inside the alt screen (for field edits)."""
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        sys.stdout.write(f"{ESC}[?25h\r\n {CYAN}{prompt}{RESET} ")
+        sys.stdout.flush()
+        try:
+            return (getpass.getpass("") if secret else input("")).strip()
+        except (KeyboardInterrupt, EOFError):
+            return None
+        finally:
+            tty.setraw(fd)
+            sys.stdout.write(f"{ESC}[?25l")
+
+    def check_line(n):
+        if n in state["probing"]:
+            return f"{DIM}probing…{RESET}"
+        chk = state["checks"].get(n)
+        if not chk:
+            return f"{DIM}probing…{RESET}"
+        if not chk.get("ok"):
+            err = chk.get("err")
+            return (f"{RED}✗ unreachable{RESET}"
+                    + (f" {DIM}— {err}{RESET}" if err else ""))
+        age = rel_time(datetime.fromtimestamp(chk["at"], timezone.utc))
+        if not chk.get("exit_ip"):
+            return (f"{GREEN}✓{RESET} {DIM}{age}{RESET}  tunnel ok"
+                    f" {DIM}· exit geo unknown{RESET}")
+        loc = " ".join(x for x in (chk.get("cc"), chk.get("city")) if x)
+        kind = chk.get("kind") or "?"
+        isp = chk.get("isp") or ""
+        warn = f" {RED}· region unsupported by Google AI{RESET}" \
+               if chk.get("cc") in UNSUPPORTED_REGIONS else ""
+        return (f"{GREEN}✓{RESET} {DIM}{age}{RESET}  {loc} · {BOLD}{kind}{RESET}"
+                + (f" · {isp}" if isp else "") + warn)
+
+    def edit_proxy(name):
+        """Per-field editor: arrows pick a field, Enter edits just that one,
+        d saves, q discards. Returns (new_name, new_cfg) or None."""
+        src = db["proxies"][name]
+        fields = [
+            ["name", name],
+            ["protocol", src.get("protocol", "http")],
+            ["host", src.get("host", "")],
+            ["port", str(src.get("port", ""))],
+            ["username", src.get("username", "")],
+            ["password", src.get("password", "")],
+            ["validity", "" if not src.get("expires_at") else
+             datetime.fromtimestamp(src["expires_at"]).strftime("%Y-%m-%d")],
+            ["fallback", "yes" if src.get("fallback") else "no"],
+        ]
+        esel, dirty = 0, False
+        while True:
+            out = [f"{ESC}[H{ESC}[2J",
+                   f"{ESC}[1m edit '{name}'{ESC}[0m  {ESC}[2m↑/↓ pick field · Enter edit · d done · q discard{ESC}[0m\r\n\r\n"]
+            for i, (fname, val) in enumerate(fields):
+                shown = "****" if fname == "password" and val else (val or f"{DIM}(empty){RESET}")
+                cur = f"{REV} {fname:<10}{RESET}" if i == esel else f"  {DIM}{fname:<10}{RESET}"
+                out.append(f" {'❯' if i == esel else ' '} {cur} {shown}\r\n")
+            sys.stdout.write("".join(out))
+            sys.stdout.flush()
+            k = read_key()
+            if k in ("up", "k"):
+                esel = (esel - 1) % len(fields)
+            elif k in ("down", "j"):
+                esel = (esel + 1) % len(fields)
+            elif k in ("q", "esc"):
+                return None
+            elif k == "d":
+                break
+            elif k == "enter":
+                fname, cur = fields[esel]
+                v = line_input(f"{fname} [{cur if fname != 'password' else '****'}] ❯",
+                               secret=(fname == "password"))
+                if not v:
+                    continue
+                err = None
+                if fname == "name":
+                    if not valid_name(v):
+                        err = "letters, digits, . _ - only"
+                    elif v != name and v in db["proxies"]:
+                        err = f"'{v}' already exists"
+                elif fname == "protocol":
+                    if v.lower() not in ("http", "https", "socks5", "socks5h"):
+                        err = "http / https / socks5 / socks5h"
+                    else:
+                        v = v.lower()
+                elif fname == "host":
+                    pass
+                elif fname == "port":
+                    try:
+                        assert 1 <= int(v) <= 65535
+                    except (ValueError, AssertionError):
+                        err = "1-65535"
+                elif fname == "validity":
+                    if v.lower() in ("never", "none", "-"):
+                        v = ""
+                    else:
+                        try:
+                            v = str(int(parse_validity(v)))
+                        except ValueError as e:
+                            err = str(e)
+                elif fname == "fallback":
+                    if v.lower() not in ("y", "yes", "n", "no"):
+                        err = "y or n"
+                if err:
+                    line_input(f"{YELLOW}{err}{RESET} — Enter to continue")
+                    continue
+                fields[esel][1] = v
+                dirty = True
+        if not dirty:
+            return None
+        f = dict(fields)
+        new = {"protocol": f["protocol"], "host": f["host"], "port": int(f["port"]),
+               "username": f["username"], "password": f["password"],
+               "expires_at": int(f["validity"]) if f["validity"] else None,
+               "fallback": f["fallback"].lower() in ("y", "yes")}
+        if src.get("check"):
+            new["check"] = src["check"]
+        return f["name"], new
+
+    def enable_selected(n):
+        nonlocal db
+        db["active"] = n
+        db2 = install_shim(db)
+        if db2 is None:
+            db["active"] = None
+            return f"{RED}agy not found on PATH{RESET}"
+        db = db2
+        write_proxy_env(db)
+        save_proxy_db(db)
+        kick_probes(force=True)
+        return f"{GREEN}✓{RESET} '{n}' ENABLED — every agy run uses it"
+
+    def render():
+        with lock:
+            checks = dict(state["checks"])
+            sel, msg, confirm = state["sel"], state["msg"], state["confirm"]
+        out = [f"{ESC}[H{ESC}[2J",
+               f"{ESC}[1m agy-switch proxy{ESC}[0m  {ESC}[2m↑/↓ move · Enter select & quit · "
+               f"space on/off · a add · e edit · R rename · d delete · r probe · q quit{ESC}[0m\r\n\r\n"]
+        ns = names()
+        if not ns:
+            out.append(f"  no proxies yet — press {ESC}[1ma{ESC}[0m to add one\r\n")
+        for i, n in enumerate(ns):
+            cfg = db["proxies"][n]
+            active = db.get("active") == n
+            st = proxy_state(cfg)
+            if active and st == "on":
+                tag = f"{GREEN}ACTIVE{RESET}"
+            elif active:
+                tag = f"{YELLOW}ACTIVE but EXPIRED → " + \
+                      ("direct" if st == "expired_fallback" else "agy blocked") + RESET
+            else:
+                tag = f"{DIM}off{RESET}"
+            dot = f"{GREEN}●{RESET}" if active else f"{GRAY}○{RESET}"
+            header = f" {'❯' if i == sel else ' '} {dot} {BOLD}{n}{RESET}  {DIM}{proxy_url(cfg, mask=True)}{RESET}  {tag}"
+            if i == sel:
+                header = REV + header.replace(RESET, RESET + REV) + RESET
+            out.append(header + "\r\n")
+            exp = expiry_text(cfg)
+            out.append(f"      {checks.get(n) and check_line(n) or f'{DIM}probing…{RESET}'}"
+                       f"  {DIM}· expires {exp}{RESET}\r\n")
+        if confirm:
+            out.append(f"\r\n {YELLOW}delete '{confirm}'? [y/N]{RESET}")
+        elif msg:
+            out.append(f"\r\n {msg}")
+        sys.stdout.write("".join(out))
+        sys.stdout.flush()
+
+    kick_probes()
+    try:
+        tty.setraw(fd)
+        sys.stdout.write(f"{ESC}[?1049h{ESC}[?25l")
+        render()
+        while True:
+            r, _, _ = select.select([sys.stdin], [], [], 0.5)
+            if not r:
+                render()
+                continue
+            k = read_key()
+            ns = names()
+            if state["confirm"]:
+                if k in ("y", "Y"):
+                    n = state["confirm"]
+                    db["proxies"].pop(n, None)
+                    state["checks"].pop(n, None)
+                    if db.get("active") == n:
+                        db["active"] = None
+                        write_proxy_env(db)
+                    save_proxy_db(db)
+                    state["sel"] = min(state["sel"], max(0, len(names()) - 1))
+                    state["msg"] = f"deleted '{n}'"
+                state["confirm"] = None
+                render()
+                continue
+            if k in ("up", "k") and ns:
+                state["sel"] = (state["sel"] - 1) % len(ns)
+            elif k in ("down", "j") and ns:
+                state["sel"] = (state["sel"] + 1) % len(ns)
+            elif k in ("q", "esc"):
+                break
+            elif k == " " and ns:  # space: toggle in place
+                n = ns[state["sel"]]
+                if db.get("active") == n:
+                    db["active"] = None
+                    write_proxy_env(db)
+                    save_proxy_db(db)
+                    state["msg"] = f"'{n}' disabled — agy runs direct"
+                else:
+                    state["msg"] = enable_selected(n)
+            elif k == "enter" and ns:  # Enter: confirm this proxy and leave
+                n = ns[state["sel"]]
+                if db.get("active") != n:
+                    state["msg"] = enable_selected(n)
+                if db.get("active") == n:
+                    state["exit_msg"] = f"proxy on ({n}: {proxy_url(db['proxies'][n], mask=True)})"
+                break
+            elif k == "a":
+                sys.stdout.write(f"{ESC}[?1049l{ESC}[?25h")
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)
+                proxy_wizard(db)          # saves + enables on its own
+                db = load_proxy_db()
+                kick_probes(force=True)
+                tty.setraw(fd)
+                sys.stdout.write(f"{ESC}[?1049h{ESC}[?25l")
+            elif k == "e" and ns:
+                n = ns[state["sel"]]
+                res = edit_proxy(n)
+                if res:
+                    new_name, new_cfg = res
+                    if new_name != n:
+                        db["proxies"].pop(n)
+                        if db.get("active") == n:
+                            db["active"] = new_name
+                    db["proxies"][new_name] = new_cfg
+                    if db.get("active") == new_name:
+                        write_proxy_env(db)
+                    save_proxy_db(db)
+                    state["checks"].pop(n, None)
+                    kick_probes(force=True)
+                    state["msg"] = f"saved '{new_name}'"
+            elif k == "R" and ns:  # rename (capital; lowercase r is re-probe)
+                n = ns[state["sel"]]
+                v = line_input(f"rename '{n}' ❯")
+                if not v or v == n:
+                    pass
+                elif not valid_name(v):
+                    state["msg"] = f"{RED}invalid name — letters, digits, . _ - only{RESET}"
+                elif v in db["proxies"]:
+                    state["msg"] = f"{RED}'{v}' already exists{RESET}"
+                else:
+                    db["proxies"] = {v if k2 == n else k2: val
+                                     for k2, val in db["proxies"].items()}
+                    if db.get("active") == n:
+                        db["active"] = v
+                        write_proxy_env(db)
+                    if n in state["checks"]:
+                        state["checks"][v] = state["checks"].pop(n)
+                    save_proxy_db(db)
+                    state["msg"] = f"renamed '{n}' → '{v}'"
+            elif k == "d" and ns:
+                state["confirm"] = ns[state["sel"]]
+            elif k == "r":
+                state["msg"] = ""
+                kick_probes(force=True)
+            render()
+    finally:
+        save_proxy_db(db)  # persist probe cache
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        sys.stdout.write(f"{ESC}[?25h{ESC}[?1049l")
+        sys.stdout.flush()
+    if state.get("exit_msg"):
+        print(state["exit_msg"])
+
+
+# ---------------------------------------------------------------- main
+
+USAGE = """agy-switch — multi-account manager for Antigravity CLI (agy) on Linux.
+
+agy keeps one OAuth token at ~/.gemini/antigravity-cli/antigravity-oauth-token.
+A "profile" is a snapshot of that file. Switching = copying a snapshot back.
+
+Usage:
+  agy-switch              interactive picker (arrows + Enter)
+  agy-switch list         same as above
+  agy-switch ls           plain list, no TUI (cached quota)
+  agy-switch login        add another account (browser login via agy)
+  agy-switch use <name>   switch to profile <name> (non-interactive)
+  agy-switch rename <a> <b>   rename a profile
+  agy-switch logout [name] [--revoke]
+                          sign an account out of this machine: delete its profile,
+                          drop the live token if it is active (interactive picker
+                          when no name is given; --revoke also kills the grant)
+  agy-switch proxy [on [name]|off|status|add]
+                          manage proxies that agy runs through — no argument:
+                          interactive manager (enable/edit/delete, exit-region
+                          and hosting/residential probe per proxy)
+
+Tokens never appear on a command line or in this tool's output."""
+
+
+def main():
+    if os.path.isdir(OLD_STORE) and not os.path.exists(STORE):
+        os.rename(OLD_STORE, STORE)
+    db = load_proxy_db()
+    if db.get("proxies") or db.get("shim_path"):
+        try:
+            install_shim(db)  # repair the shim if `agy update` replaced it
+        except Exception:
+            pass
+    apply_proxy_to_self()
+
+    args = sys.argv[1:]
+    cmd = args[0] if args else "list"
+
+    if cmd != "proxy":
+        state, cc = net_ok()
+        if state == "blocked":
+            print("agy-switch: cannot reach Google's API from this network — agy may fail\n"
+                  "  or report 'region not supported'. Fix: agy-switch proxy", file=sys.stderr)
+        elif state == "region":
+            print(f"agy-switch: your current IP region ({cc or '?'}) is not supported by Google AI —\n"
+                  "  agy will report 'region not supported'. Fix: agy-switch proxy\n"
+                  "  (route through a supported region such as JP/SG/US)", file=sys.stderr)
+
+    if cmd in ("list",):
+        name = tui("switch")
+        if name:
+            switch_to(name)
+            print(f"switched to '{name}' ({decode_email(live_token())})")
+            warn_running_agy()
+            agy = shutil.which("agy")
+            if agy:
+                os.execvp(agy, ["agy"])  # straight into the session
+            print("agy not found on PATH — install it, then just run: agy")
+        else:
+            print("no change")
+    elif cmd == "ls":
+        cmd_ls()
+    elif cmd == "login":
+        cmd_login()
+    elif cmd == "rename":
+        if len(args) != 3:
+            die("usage: agy-switch rename <old> <new>")
+        cmd_rename(args[1], args[2])
+    elif cmd == "use":
+        cmd_use(args[1] if len(args) > 1 else die("usage: agy-switch use <name>"))
+    elif cmd == "logout":
+        rest = [a for a in args[1:] if a != "--revoke"]
+        cmd_logout(rest[0] if rest else None, "--revoke" in args[1:])
+    elif cmd == "proxy":
+        cmd_proxy(args[1:])
+    elif cmd in ("-h", "--help", "help"):
+        print(USAGE)
+    elif cmd in ("-v", "--version", "version"):
+        print(f"agy-switch {VERSION}")
+    else:
+        print(USAGE, file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
