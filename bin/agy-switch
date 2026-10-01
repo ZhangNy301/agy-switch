@@ -355,6 +355,20 @@ def save_meta(meta):
     write_json_atomic(META_FILE, meta)
 
 
+_META_LOCK = threading.Lock()
+
+
+def update_meta(mutate):
+    """Serialized load -> mutate -> save of meta.json: the TUI refreshes one
+    profile per thread, and unsynchronized whole-file writes made the last
+    saver silently drop the other threads' fresh quota entries. The re-load
+    inside the lock merges into the newest meta, never a stale copy."""
+    with _META_LOCK:
+        meta = load_meta()
+        mutate(meta)
+        save_meta(meta)
+
+
 # ---------------------------------------------------------------- token ops
 
 def _json_call(url, body, headers=None, timeout=20):
@@ -458,7 +472,17 @@ def fetch_quota(access_token):
     except Exception:
         out["tier"] = "?"
     try:
-        qs = post(access_token, "/v1internal:retrieveUserQuotaSummary")
+        # one retry of just this call: a single transient failure here
+        # otherwise leaves the quota display blank for a whole QUOTA_TTL cycle
+        qs = None
+        for attempt in range(2):
+            try:
+                qs = post(access_token, "/v1internal:retrieveUserQuotaSummary")
+                break
+            except Exception:
+                if attempt:
+                    raise
+                time.sleep(1)
         for group in qs.get("groups", []):
             name = (group.get("displayName") or "").lower()
             key = "gemini" if "gemini" in name else "claude"
@@ -493,10 +517,12 @@ def quota_for_profile(name, force=False):
         tok = ensure_fresh_token(os.path.join(PROFILES, f"{name}.json"))
         q = fetch_quota(tok["token"]["access_token"])
         if "host" in q:  # the quota call actually succeeded — safe to cache
-            entry["quota"] = q
-            entry["quota_at"] = time.time()
-            meta[name] = entry
-            save_meta(meta)
+            def _cache(meta):
+                entry = meta.get(name, {})
+                entry["quota"] = q
+                entry["quota_at"] = time.time()
+                meta[name] = entry
+            update_meta(_cache)
             return q, True
         if q:  # partial (e.g. tier only) — show this run, don't poison the cache
             return q, False
@@ -657,11 +683,12 @@ def live_was_clobbered():
 
 def mark_active(name):
     set_current(name)
-    meta = load_meta()
-    entry = meta.get(name, {})
-    entry["activated_at"] = time.time()
-    meta[name] = entry
-    save_meta(meta)
+
+    def _mark(meta):
+        entry = meta.get(name, {})
+        entry["activated_at"] = time.time()
+        meta[name] = entry
+    update_meta(_mark)
 
 
 def running_agy_procs():
@@ -754,10 +781,11 @@ def cmd_rename(old, new):
     if os.path.exists(profile_path(new)):
         die(f"profile '{new}' already exists")
     os.rename(src, profile_path(new))
-    meta = load_meta()
-    if old in meta:
-        meta[new] = meta.pop(old)
-        save_meta(meta)
+
+    def _rename(meta):
+        if old in meta:
+            meta[new] = meta.pop(old)
+    update_meta(_rename)
     print(f"renamed profile '{old}' → '{new}'")
 
 
@@ -813,9 +841,7 @@ def cmd_logout(name, revoke):
             os.remove(path)
             was_live = True
     os.remove(profile_path(name))
-    meta = load_meta()
-    meta.pop(name, None)
-    save_meta(meta)
+    update_meta(lambda meta: meta.pop(name, None))
     clear_current(name)
     print(f"logged out '{name}' ({email})", end="")
     print(", was the live login — next agy run will ask for browser login" if was_live else "")
