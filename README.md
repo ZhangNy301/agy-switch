@@ -7,7 +7,7 @@
 [![npm](https://img.shields.io/npm/v/agy-switch)](https://www.npmjs.com/package/agy-switch)
 [![license](https://img.shields.io/npm/l/agy-switch)](LICENSE)
 
-https://github.com/ZhangNy301/agy-switch/releases/download/demo-assets/agy-switch-demo.mp4
+[![demo](https://github.com/ZhangNy301/agy-switch/releases/download/demo-assets/agy-switch-demo.gif)](https://github.com/ZhangNy301/agy-switch/releases/download/demo-assets/agy-switch-demo.mp4)
 
 ## Why
 
