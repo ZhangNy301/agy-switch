@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.0.5
+
+- Fix quota entries silently lost during TUI refresh: each profile refreshed
+  on its own thread and every writer did an unsynchronized whole-file
+  read-modify-write of meta.json, so the last saver dropped the other
+  threads' fresh entries. All meta.json writes now go through a serialized
+  update_meta() that re-loads inside the lock and merges into the newest copy
+- Retry a transient retrieveUserQuotaSummary failure once (~1s later) instead
+  of leaving the quota display blank for a whole TTL cycle; the tier call is
+  not retried and partial results are still never cached
+
 ## 1.0.4
 
 - macOS: support agy's Keychain credential storage. On GUI desktops agy keeps
