@@ -7,6 +7,8 @@
 [![npm](https://img.shields.io/npm/v/agy-switch)](https://www.npmjs.com/package/agy-switch)
 [![license](https://img.shields.io/npm/l/agy-switch)](LICENSE)
 
+<video src="https://github.com/ZhangNy301/agy-switch/releases/download/demo-assets/agy-switch-demo.mp4" controls muted playsinline width="100%"></video>
+
 ## 为什么需要它
 
 `agy` 在磁盘上只保存一个 OAuth token，想换账号就得退出重新登录。**agy-switch** 把每个账号的 token 存成快照：

@@ -7,6 +7,8 @@
 [![npm](https://img.shields.io/npm/v/agy-switch)](https://www.npmjs.com/package/agy-switch)
 [![license](https://img.shields.io/npm/l/agy-switch)](LICENSE)
 
+<video src="https://github.com/ZhangNy301/agy-switch/releases/download/demo-assets/agy-switch-demo.mp4" controls muted playsinline width="100%"></video>
+
 ## Why
 
 `agy` keeps exactly one OAuth token on disk, so juggling multiple Google accounts means logging out and back in every time. **agy-switch** snapshots that token per account:
