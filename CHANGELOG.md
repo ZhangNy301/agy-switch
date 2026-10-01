@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.0.4
+
+- macOS: support agy's Keychain credential storage. On GUI desktops agy keeps
+  its OAuth token only in the login keychain (generic-password item, service
+  "gemini" / account "antigravity", go-keyring base64 envelope) and never
+  writes a token file — which made `login` report "no token was written" and
+  `ls` show "no accounts yet". agy-switch now reads, watches, writes and
+  deletes that item, so login, the picker, switch and logout all work on
+  macOS. SSH sessions keep agy's file-based behavior; a keychain that refuses
+  access degrades to the token file with a warning instead of a traceback
+- Fix a race where the proxy shim re-asserted the previous account on every
+  agy start — including the agy launched by `agy-switch login` after it had
+  deliberately removed the live credential, resurrecting the old login before
+  agy could show the browser flow
+
 ## 1.0.3
 
 - Fix account misidentification when adopting a live login whose id_token is
