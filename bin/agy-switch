@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-# agy-switch — multi-account manager for Antigravity CLI (agy) on Linux.
+# agy-switch — multi-account manager for Antigravity CLI (agy).
 #
-# agy keeps one OAuth token at ~/.gemini/antigravity-cli/antigravity-oauth-token.
-# A "profile" is a snapshot of that file. Switching = copying a snapshot back.
+# agy keeps one OAuth token at ~/.gemini/antigravity-cli/antigravity-oauth-token;
+# on macOS with a GUI it instead lives in the login keychain (via go-keyring:
+# service "gemini", account "antigravity", value = base64-wrapped token JSON).
+# A "profile" is a snapshot of that credential. Switching = writing one back.
 #
 # Usage:
 #   agy-switch              interactive picker (arrows + Enter)
@@ -41,6 +43,13 @@ LIVE = os.path.expanduser("~/.gemini/antigravity-cli/antigravity-oauth-token")
 # gemini-cli layout — agy falls back to it when its own file is absent
 # (seen in the wild on macOS installs that predate the antigravity-cli dir)
 LEGACY_LIVE = os.path.expanduser("~/.gemini/oauth_creds.json")
+# macOS keychain item agy uses on GUI desktops (go-keyring shells out to
+# /usr/bin/security). The secret is the same nested token JSON as the file,
+# wrapped in a "go-keyring-base64:<base64>" envelope.
+KEYCHAIN_SERVICE = "gemini"
+KEYCHAIN_ACCOUNT = "antigravity"
+KEYCHAIN_LOC = f"keychain://{KEYCHAIN_SERVICE}/{KEYCHAIN_ACCOUNT}"
+_GO_KEYRING_B64 = "go-keyring-base64:"
 OLD_STORE = os.path.expanduser("~/.local/share/agy-account")
 STORE = os.path.expanduser("~/.local/share/agy-switch")
 PROFILES = os.path.join(STORE, "profiles")
@@ -204,6 +213,117 @@ def write_json_atomic(path, obj):
         json.dump(obj, f)
     os.chmod(tmp, 0o600)
     os.replace(tmp, path)
+
+
+# ------------------------------------------------------- macOS keychain store
+
+def ssh_detected():
+    """agy switches to file-based token storage when it detects an SSH session
+    (its keyring_detector_ssh fires on any of these variables)."""
+    return any(os.environ.get(v) for v in ("SSH_CONNECTION", "SSH_TTY", "SSH_CLIENT"))
+
+
+_USE_KC = None
+KC_DEGRADED = ""  # last keychain error, reported once by kc_warn()
+
+
+def use_keychain():
+    """True when agy here stores its token in the macOS login keychain: darwin,
+    a local GUI session (not SSH), and the `security` CLI present."""
+    global _USE_KC
+    if _USE_KC is None:
+        _USE_KC = (sys.platform == "darwin" and not ssh_detected()
+                   and shutil.which("security") is not None)
+    return _USE_KC
+
+
+def _kc_run(args, stdin=None):
+    """Run /usr/bin/security, return (rc, stdout, stderr). Never raises — a
+    locked keychain or denied access degrades to file storage, not a crash."""
+    try:
+        r = subprocess.run(["security"] + args, capture_output=True, text=True,
+                           timeout=15, input=stdin)
+        return r.returncode, r.stdout, r.stderr
+    except Exception as e:
+        return 1, "", str(e)
+
+
+def kc_read_raw():
+    """Secret string of agy's keychain item, or None when absent/unreadable."""
+    global KC_DEGRADED
+    rc, out, err = _kc_run(["find-generic-password", "-s", KEYCHAIN_SERVICE,
+                            "-a", KEYCHAIN_ACCOUNT, "-w"])
+    if rc != 0:
+        if "could not be found" not in err:
+            KC_DEGRADED = err.strip() or f"security exited {rc}"
+        return None
+    return out.rstrip("\n")
+
+
+def kc_decode(raw):
+    """Keychain secret string -> token dict (unwraps go-keyring's base64 envelope)."""
+    if not raw:
+        return None
+    if raw.startswith(_GO_KEYRING_B64):
+        import base64
+        try:
+            raw = base64.b64decode(raw[len(_GO_KEYRING_B64):]).decode("utf-8", "replace")
+        except Exception:
+            return None
+    try:
+        d = json.loads(raw)
+        return d if isinstance(d, dict) else None
+    except Exception:
+        return None
+
+
+def kc_read_cred():
+    """(nested token|None, style) for the keychain item — read_cred's contract."""
+    d = kc_decode(kc_read_raw())
+    if isinstance(d, dict) and d.get("token", {}).get("refresh_token"):
+        return d, "keychain"
+    return None, None
+
+
+def kc_write(nested):
+    """Write the live keychain item. The blob can carry fields beyond the token
+    (agy logs about saving the user tier there) — overlay ours onto the existing
+    blob so they survive. The secret travels on stdin (`security -i`), never on
+    a command line. Returns True only when the write reads back correctly."""
+    global KC_DEGRADED
+    base = kc_decode(kc_read_raw()) or {}
+    base.update(nested)
+    import base64
+    blob = _GO_KEYRING_B64 + base64.b64encode(json.dumps(base).encode()).decode()
+    rc, _o, err = _kc_run(["-i"], stdin="add-generic-password -U -s %s -a %s -w %s\n"
+                          % (KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, blob))
+    if rc != 0:
+        KC_DEGRADED = err.strip() or f"security exited {rc}"
+        return False
+    # `security -i` reports a failed subcommand only as text, not via exit code
+    d = kc_decode(kc_read_raw())
+    ok = (isinstance(d, dict)
+          and d.get("token", {}).get("refresh_token") == nested.get("token", {}).get("refresh_token"))
+    if not ok:
+        KC_DEGRADED = "keychain write did not stick"
+    return ok
+
+
+def kc_delete():
+    """Remove agy's keychain item; True when gone (or never there)."""
+    global KC_DEGRADED
+    rc, _o, err = _kc_run(["delete-generic-password",
+                           "-s", KEYCHAIN_SERVICE, "-a", KEYCHAIN_ACCOUNT])
+    if rc != 0 and "could not be found" not in err:
+        KC_DEGRADED = err.strip() or f"security exited {rc}"
+        return False
+    return True
+
+
+def kc_warn():
+    if KC_DEGRADED:
+        print(f"agy-switch: macOS keychain unavailable ({KC_DEGRADED}) — "
+              f"using agy's token file instead", file=sys.stderr)
 
 
 def decode_email(tok):
@@ -444,17 +564,37 @@ def read_cred(path):
 
 
 def live_cred():
-    """The credential file agy actually uses: (path, nested token|None, style).
-    agy prefers its own file and falls back to the legacy gemini-cli one."""
+    """The credential agy actually uses: (loc, nested token|None, style).
+    loc is a file path, or KEYCHAIN_LOC on macOS GUI desktops — agy prefers the
+    keychain there and only then falls back to its own file, then the legacy
+    gemini-cli one."""
+    if use_keychain():
+        nested, style = kc_read_cred()
+        if nested:
+            return KEYCHAIN_LOC, nested, style
     for path in (LIVE, LEGACY_LIVE):
         nested, style = read_cred(path)
         if nested:
             return path, nested, style
+    if use_keychain():
+        return KEYCHAIN_LOC, None, "keychain"
     return LIVE, None, "nested"
 
 
-def write_live(nested, path, style):
-    write_json_atomic(path, nested if style == "nested" else nested_to_flat(nested))
+def write_live(nested, loc, style):
+    """Write the live credential where agy reads it. On macOS that is the
+    keychain; an existing token file is kept in sync as a mirror (an agy started
+    over SSH reads only the file), while the legacy gemini-cli file is never
+    written. A refused keychain degrades to the token file with a warning."""
+    if loc == KEYCHAIN_LOC:
+        if kc_write(nested):
+            if os.path.isfile(LIVE):
+                write_json_atomic(LIVE, nested)
+            return
+        kc_warn()
+        write_json_atomic(LIVE, nested)
+        return
+    write_json_atomic(loc, nested if style == "nested" else nested_to_flat(nested))
 
 
 def live_token():
@@ -540,7 +680,7 @@ def warn_running_agy():
     if n:
         print(f"{YELLOW}note:{RESET} {n} agy session(s) still running with the previous account — "
               "they keep it until restarted.\n  (their hourly token refresh may briefly overwrite "
-              "the login file; every new agy start auto-corrects back to this account)")
+              "the live credential; every new agy start auto-corrects back to this account)")
 
 
 def adopt_live_if_orphan():
@@ -660,6 +800,13 @@ def cmd_logout(name, revoke):
             die(f"revoke failed ({e}) — the grant is still valid, nothing was deleted")
         print(f"grant revoked at Google for {email}")
     was_live = False
+    if use_keychain():
+        nested, _s = kc_read_cred()
+        if nested and refresh_token_of(nested) == refresh_token_of(tok):
+            if kc_delete():
+                was_live = True
+            else:
+                kc_warn()
     for path in (LIVE, LEGACY_LIVE):
         nested, _style = read_cred(path)
         if nested and refresh_token_of(nested) == refresh_token_of(tok):
@@ -701,19 +848,37 @@ def cmd_login():
     os.makedirs(PROFILES, exist_ok=True)
 
     lp, live, style = live_cred()
-    stashed_rt = ""
+    stashed_rts = set()
+    extra = []
     if live:
         write_json_atomic(profile_path("_last"), live)  # same auto-backup as `use`
-        stashed_rt = refresh_token_of(live)
-        write_json_atomic(stash, {"path": lp, "style": style, "token": live})
-        os.remove(lp)
+        stashed_rts.add(refresh_token_of(live))
+        if lp == KEYCHAIN_LOC:
+            if not kc_delete():
+                kc_warn()
+            # with the keychain entry gone agy would fall back to its token file
+            # and look logged in — stash that too so the browser flow starts
+            n2, s2 = read_cred(LIVE)
+            if n2:
+                extra.append({"path": LIVE, "style": s2, "token": n2})
+                stashed_rts.add(refresh_token_of(n2))
+                os.remove(LIVE)
+        else:
+            os.remove(lp)
+        write_json_atomic(stash, {"path": lp, "style": style, "token": live,
+                                  "extra": extra})
 
     def find_new_cred():
-        """A freshly-written credential at either known path (not the stashed
-        one — a still-running agy of the old account can rewrite its file)."""
+        """A freshly-written credential in any store agy may use here (never a
+        stashed one — a still-running agy of the old account can rewrite its
+        keychain item or file)."""
+        if use_keychain():
+            nested, _s = kc_read_cred()
+            if nested and refresh_token_of(nested) not in stashed_rts:
+                return nested
         for path in (LIVE, LEGACY_LIVE):
             nested, _s = read_cred(path)
-            if nested and refresh_token_of(nested) != stashed_rt:
+            if nested and refresh_token_of(nested) not in stashed_rts:
                 return nested
         return None
 
@@ -731,12 +896,16 @@ def cmd_login():
     print("(tip: pick the right Google account in the browser's account chooser)")
     watcher = threading.Thread(target=watch, daemon=True)
     watcher.start()
+    # the proxy shim re-asserts the recorded account into the live store on
+    # every agy start — exactly what this login just stashed away. Stand down.
+    os.environ["AGY_SWITCH_NO_REASSERT"] = "1"
     try:
         subprocess.call([AGY_BIN])
     except KeyboardInterrupt:
         pass
     finally:
         stop.set()
+        os.environ.pop("AGY_SWITCH_NO_REASSERT", None)
         watcher.join(timeout=2)
 
     # the poll loop can miss a token written in agy's final moments — check once more
@@ -782,6 +951,8 @@ def cmd_login():
             st = load_json(stash) or {}
             if st.get("token"):
                 write_live(st["token"], st.get("path") or LIVE, st.get("style") or "nested")
+            for x in st.get("extra", []):
+                write_live(x["token"], x.get("path") or LIVE, x.get("style") or "nested")
             os.remove(stash)
             print("login not completed — original account restored, nothing changed")
         else:
@@ -1110,12 +1281,20 @@ if { [ $(( $(date +%s) - ${LAST:-0} )) -ge "$TTL" ] || [ "$CTAG" != "$TAG" ]; } 
   fi
 fi
 # re-assert the account picked via agy-switch: a still-running agy of another
-# account rewrites the shared token file when its access token refreshes
+# account rewrites the shared credential when its access token refreshes
 # (hourly), which would otherwise silently revert the login. Skip when the live
-# token already carries the same refresh token (same account, possibly fresher).
+# credential already carries the same refresh token (same account, possibly
+# fresher). On macOS with a GUI the credential lives in the login keychain
+# (item: service gemini / account antigravity, go-keyring-base64 envelope);
+# agy itself switches to the plain token file in SSH sessions, so the shim
+# mirrors that split. Keychain writes go over stdin (`security -i`) so the
+# token never appears on a command line.
+# AGY_SWITCH_NO_REASSERT: `agy-switch login` sets this while the browser flow
+# runs — it deliberately removed the live credential to force a fresh login,
+# and re-asserting here would resurrect the old account before agy starts.
 CUR="$HOME/.local/share/agy-switch/current"
 TOK="$HOME/.gemini/antigravity-cli/antigravity-oauth-token"
-if [ -f "$CUR" ]; then
+if [ -f "$CUR" ] && [ -z "$AGY_SWITCH_NO_REASSERT" ]; then
   P=$(head -c 64 "$CUR" 2>/dev/null)
   case "$P" in
     ""|*[!A-Za-z0-9._-]*) : ;;
@@ -1123,9 +1302,34 @@ if [ -f "$CUR" ]; then
       SRC="$HOME/.local/share/agy-switch/profiles/$P.json"
       if [ -f "$SRC" ]; then
         RT_S=$(grep -o '"refresh_token"[: ]*"[^"]*"' "$SRC" 2>/dev/null | head -1)
-        RT_L=$(grep -o '"refresh_token"[: ]*"[^"]*"' "$TOK" 2>/dev/null | head -1)
-        if [ -n "$RT_S" ] && [ "$RT_S" != "$RT_L" ]; then
-          cp "$SRC" "$TOK.tmp.$$" 2>/dev/null && chmod 600 "$TOK.tmp.$$" && mv -f "$TOK.tmp.$$" "$TOK"
+        KC=0
+        if [ "$(uname -s)" = "Darwin" ] && [ -z "$SSH_CONNECTION" ] && [ -z "$SSH_TTY" ] \
+           && [ -z "$SSH_CLIENT" ] && command -v security >/dev/null 2>&1; then
+          KC=1
+        fi
+        if [ "$KC" = "1" ]; then
+          RAW=$(security find-generic-password -s gemini -a antigravity -w 2>/dev/null)
+          case "$RAW" in
+            go-keyring-base64:*)
+              B=${RAW#go-keyring-base64:}
+              LJSON=$(printf '%s' "$B" | base64 -d 2>/dev/null || printf '%s' "$B" | base64 -D 2>/dev/null) ;;
+            *) LJSON=$RAW ;;
+          esac
+          RT_L=$(printf '%s' "$LJSON" | grep -o '"refresh_token"[: ]*"[^"]*"' | head -1)
+          if [ -n "$RT_S" ] && [ "$RT_S" != "$RT_L" ]; then
+            B=$(base64 < "$SRC" 2>/dev/null | tr -d '\n')
+            if [ -n "$B" ]; then
+              printf '%s\n' "add-generic-password -U -s gemini -a antigravity -w go-keyring-base64:$B" \
+                | security -i >/dev/null 2>&1
+              # keep an existing token file in sync for agy sessions over SSH
+              [ -f "$TOK" ] && cp "$SRC" "$TOK.tmp.$$" 2>/dev/null && chmod 600 "$TOK.tmp.$$" && mv -f "$TOK.tmp.$$" "$TOK"
+            fi
+          fi
+        else
+          RT_L=$(grep -o '"refresh_token"[: ]*"[^"]*"' "$TOK" 2>/dev/null | head -1)
+          if [ -n "$RT_S" ] && [ "$RT_S" != "$RT_L" ]; then
+            cp "$SRC" "$TOK.tmp.$$" 2>/dev/null && chmod 600 "$TOK.tmp.$$" && mv -f "$TOK.tmp.$$" "$TOK"
+          fi
         fi
       fi
       ;;
@@ -2068,10 +2272,12 @@ def proxy_manager():
 
 # ---------------------------------------------------------------- main
 
-USAGE = """agy-switch — multi-account manager for Antigravity CLI (agy) on Linux.
+USAGE = """agy-switch — multi-account manager for Antigravity CLI (agy).
 
-agy keeps one OAuth token at ~/.gemini/antigravity-cli/antigravity-oauth-token.
-A "profile" is a snapshot of that file. Switching = copying a snapshot back.
+agy keeps one OAuth token at ~/.gemini/antigravity-cli/antigravity-oauth-token
+(on macOS with a GUI: in the login keychain, service "gemini" / account
+"antigravity"). A "profile" is a snapshot of that credential.
+Switching = writing a snapshot back.
 
 Usage:
   agy-switch              interactive picker (arrows + Enter)

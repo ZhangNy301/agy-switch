@@ -72,7 +72,7 @@ asw                  # 选账号 → Enter → 直接进入 agy
 
 ## 工作原理
 
-- **配置（profile）**就是 agy OAuth token 的快照，切换即把快照写回。token 从不出现在命令行或输出里。agy 用到的两个凭证位置都支持：`~/.gemini/antigravity-cli/antigravity-oauth-token`（优先）和旧版 gemini-cli 风格的 `~/.gemini/oauth_creds.json`（部分 macOS 安装）。在 agy 已登录的机器上首次运行会自动把当前登录收养为第一个账号。
+- **配置（profile）**就是 agy OAuth 凭证的快照，切换即把快照写回。token 从不出现在命令行或输出里。agy 用到的所有凭证位置都支持：macOS 图形桌面下的系统钥匙串（go-keyring 条目，service `gemini` / account `antigravity`）、`~/.gemini/antigravity-cli/antigravity-oauth-token`（Linux，以及 SSH 会话下的 macOS）、旧版 gemini-cli 风格的 `~/.gemini/oauth_creds.json`。在 agy 已登录的机器上首次运行会自动把当前登录收养为第一个账号。
 - 数据存放在 `~/.local/share/agy-switch/`（账号快照、额度缓存、代理配置）。
 - 启用代理后，agy-switch 会在 `~/.local/bin/agy` 安装一个小 shim：先注入代理环境变量，再 exec 真正的 `agy`。如果你自己在 shell 里 export 了 `http_proxy`/`https_proxy`，你的设置优先。
 - 额度读取自 agy 的本地状态并后台刷新；刷新失败时显示缓存值。
