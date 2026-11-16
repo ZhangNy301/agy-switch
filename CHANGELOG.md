@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.0.6
+
+- Fix tools run inside agy breaking behind a SOCKS proxy. The shim exported
+  the `socks5h://` URL into all six proxy variables, which every process agy
+  starts inherits — but `gh` (and any binary built with Go ≤ 1.22) parses
+  `socks5h` as a hostname and fails with "error connecting to socks5h" (so
+  `gh auth status` even reports the token as invalid), and npm / Node's fetch
+  can't use SOCKS at all. For SOCKS proxies the shim now exports a local
+  `http://` bridge instead: a small on-demand HTTP proxy on 127.0.0.1 that
+  forwards CONNECT and plain-http requests through the SOCKS upstream with
+  remote DNS. It requires a random per-install token (no free ride for other
+  users of a shared host), keeps its port across restarts so running sessions
+  survive, reloads proxy edits live and exits when idle with no agy running.
+  SOCKS credentials no longer leak into child environments. If the bridge
+  can't start, the shim warns and falls back to the raw SOCKS URL
+- New `agy-switch bridge [status|stop]`; `proxy status` shows the bridge
+- The shim's network-probe cache tag uses the configured upstream, so it
+  stays shared with `agy-switch` itself when the bridge is in use
+- A bridge URL in the environment (inside an agy session) is no longer
+  "detected" as the user's own proxy by the add-proxy wizard
+
 ## 1.0.5
 
 - Fix quota entries silently lost during TUI refresh: each profile refreshed

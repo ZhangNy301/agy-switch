@@ -64,6 +64,7 @@ In the picker: `↑`/`↓` move, `Enter` switch & launch agy, `r` refresh quotas
 | `agy-switch proxy` | Interactive proxy manager |
 | `agy-switch proxy status` | Plain proxy + network status |
 | `agy-switch proxy on [name]` / `off` | Enable / disable a proxy non-interactively |
+| `agy-switch bridge [status\|stop]` | Inspect / stop the local bridge used for SOCKS proxies (started automatically) |
 | `agy-switch --version` | Print version |
 
 ### Proxy manager keys
@@ -77,6 +78,7 @@ Add flow asks only for `server`, `port`, `username?`, `password?` — the protoc
 - A **profile** is a snapshot of agy's OAuth credential. Switching writes the snapshot back. Tokens never appear on the command line or in output. Every credential location agy uses is supported: the macOS login keychain on GUI desktops (go-keyring item, service `gemini` / account `antigravity`), `~/.gemini/antigravity-cli/antigravity-oauth-token` (Linux, and macOS over SSH), and the legacy gemini-cli-style `~/.gemini/oauth_creds.json`. First run on a machine where agy is already logged in adopts that login as the first profile automatically.
 - Data lives in `~/.local/share/agy-switch/` (profiles, quota cache, proxy configs).
 - When a proxy is enabled, agy-switch installs a tiny shim at `~/.local/bin/agy` that exports the proxy environment and then execs the real `agy`. Your shell's own `http_proxy`/`https_proxy` still wins if you exported them.
+- **SOCKS proxies go through a local bridge.** Everything agy runs (its shell commands, `gh`, `git`, `npm`, …) inherits the proxy variables, and many tools can't use a `socks5h://` URL from them — `gh` and other binaries built with Go ≤ 1.22 fail with `error connecting to socks5h`, npm and Node don't speak SOCKS at all. So for a SOCKS proxy the shim exports `http://agy-switch:<token>@127.0.0.1:<port>` instead: a small HTTP proxy, started on demand, that forwards every request through your SOCKS proxy with remote DNS (like `socks5h`). It listens on localhost only, requires a random per-install token (other users on a shared host can't use your proxy), keeps the same port across restarts, picks up proxy edits without restarting agy, and exits once idle with no agy running. Your SOCKS credentials never appear in child processes' environment. `agy-switch bridge status` / `stop` inspect it; its log is `~/.local/share/agy-switch/bridge.log`.
 - Quotas are read from agy's local state and refreshed in the background; cached values are shown when refresh fails.
 
 ## Uninstall

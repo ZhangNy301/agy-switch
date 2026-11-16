@@ -64,6 +64,7 @@ asw                  # 选账号 → Enter → 直接进入 agy
 | `agy-switch proxy` | 交互式代理管理器 |
 | `agy-switch proxy status` | 纯文本代理 + 网络状态 |
 | `agy-switch proxy on [名字]` / `off` | 非交互启用 / 关闭代理 |
+| `agy-switch bridge [status\|stop]` | 查看 / 停止 SOCKS 代理使用的本地转换代理（自动启动） |
 | `agy-switch --version` | 打印版本号 |
 
 ### 代理管理器按键
@@ -77,6 +78,7 @@ asw                  # 选账号 → Enter → 直接进入 agy
 - **配置（profile）**就是 agy OAuth 凭证的快照，切换即把快照写回。token 从不出现在命令行或输出里。agy 用到的所有凭证位置都支持：macOS 图形桌面下的系统钥匙串（go-keyring 条目，service `gemini` / account `antigravity`）、`~/.gemini/antigravity-cli/antigravity-oauth-token`（Linux，以及 SSH 会话下的 macOS）、旧版 gemini-cli 风格的 `~/.gemini/oauth_creds.json`。在 agy 已登录的机器上首次运行会自动把当前登录收养为第一个账号。
 - 数据存放在 `~/.local/share/agy-switch/`（账号快照、额度缓存、代理配置）。
 - 启用代理后，agy-switch 会在 `~/.local/bin/agy` 安装一个小 shim：先注入代理环境变量，再 exec 真正的 `agy`。如果你自己在 shell 里 export 了 `http_proxy`/`https_proxy`，你的设置优先。
+- **SOCKS 代理经本地转换代理（bridge）转发。** agy 运行的所有命令（shell 命令、`gh`、`git`、`npm` 等）都会继承代理环境变量，而很多工具不认 `socks5h://`：`gh` 等用 Go ≤ 1.22 编译的程序会报 `error connecting to socks5h`，npm 和 Node 根本不支持 SOCKS。因此当前代理是 SOCKS 时，shim 改为导出 `http://agy-switch:<token>@127.0.0.1:<端口>`：一个按需启动的小 HTTP 代理，把每个请求经你的 SOCKS 代理转发出去，域名交给远端解析（与 `socks5h` 相同）。它只监听本机，需要每台机器随机生成的 token（共用主机上的其他用户无法蹭用你的代理），重启后端口不变，修改代理配置无需重启 agy，空闲且没有 agy 在运行时自动退出。SOCKS 账号密码不会出现在子进程的环境变量里。用 `agy-switch bridge status` / `stop` 查看或停止，日志在 `~/.local/share/agy-switch/bridge.log`。
 - 额度读取自 agy 的本地状态并后台刷新；刷新失败时显示缓存值。
 
 ## 卸载
