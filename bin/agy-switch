@@ -18,16 +18,23 @@
 #                           the grant at Google)
 #   agy-switch proxy [on|off|status]      route agy through a proxy
 #                           (no argument: interactive setup)
+#   agy-switch bridge [status|stop]       local http:// bridge for SOCKS proxies
+#                           (started automatically by the agy shim)
 #
 # Tokens never appear on a command line or in this tool's output.
 
+import base64
 import getpass
+import hmac
 import json
 import os
 import re
+import secrets
 import select
 import shlex
 import shutil
+import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -59,11 +66,27 @@ PROXY_ENV = os.path.join(STORE, "proxy.env")
 NETCHECK = os.path.join(STORE, ".netcheck")
 CURRENT = os.path.join(STORE, "current")  # profile name of the last switch/login
 
-VERSION = "1.0.5"
+VERSION = "1.0.6"
+
+# username of the local SOCKS bridge's proxy URL (see "socks bridge" below)
+BRIDGE_USER = "agy-switch"
+
+
+def _env_proxy_url():
+    url = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or ""
+    try:
+        # inside an agy session the env holds our own local bridge — that is not
+        # a proxy the user set up, so it must not be "detected" as one
+        if urllib.parse.urlsplit(url).username == BRIDGE_USER:
+            return ""
+    except ValueError:
+        pass
+    return url
+
 
 # proxy env present BEFORE we inject our own (apply_proxy_to_self) — used to
 # detect users who already have their own injection (e.g. from ~/.bashrc)
-ENV_PROXY_URL = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or ""
+ENV_PROXY_URL = _env_proxy_url()
 
 TOKEN_URL = "https://oauth2.googleapis.com/token"
 REVOKE_URL = "https://oauth2.googleapis.com/revoke"
@@ -1277,7 +1300,9 @@ fi
 # cache format: "epoch state cc tag" — state 0=blocked 1=ok 2=unsupported region
 TAG="D"
 if [ "$USE" = "1" ]; then
-  TAG="P:$(printf '%s' "${HTTPS_PROXY:-${https_proxy:-}}" | sed 's|^[a-zA-Z]*://||; s|.*@||; s|/.*||')"
+  # AGY_PROXY_TAG is the configured upstream host:port — HTTPS_PROXY may be the
+  # local SOCKS bridge, which would not match the tag `agy-switch` itself writes
+  TAG="P:${AGY_PROXY_TAG:-$(printf '%s' "${HTTPS_PROXY:-${https_proxy:-}}" | sed 's|^[a-zA-Z]*://||; s|.*@||; s|/.*||')}"
 elif [ -n "${HTTPS_PROXY:-${https_proxy:-}}" ]; then
   # user's own env proxy (e.g. from ~/.bashrc) — probe goes through it too
   TAG="E:$(printf '%s' "${HTTPS_PROXY:-${https_proxy:-}}" | sed 's|^[a-zA-Z]*://||; s|.*@||; s|/.*||')"
@@ -1444,6 +1469,9 @@ def active_proxy(db=None):
     return name, cfg, proxy_state(cfg)
 
 
+PROXY_VARS = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy")
+
+
 def write_proxy_env(db=None):
     db = db if db is not None else load_proxy_db()
     name, cfg, _ = active_proxy(db)
@@ -1455,17 +1483,43 @@ def write_proxy_env(db=None):
         f"AGY_PROXY_FALLBACK={1 if cfg and cfg.get('fallback') else 0}",
     ]
     url = proxy_url(cfg) if cfg else ""
+    if cfg:
+        tag = f"{cfg.get('host')}:{cfg.get('port')}"
+        lines.append(f"AGY_PROXY_TAG={shlex.quote(tag)}")
     lines.append("AGY_SET=")
     lines.append('if [ "${AGY_PROXY_ENABLED:-0}" = "1" ]; then')
+    lines.append(f"  AGY_PROXY_URL={shlex.quote(url)}")
+    if is_socks(cfg):
+        # everything agy runs inherits these variables, and many tools can't use
+        # a socks5h:// URL from them (gh / Go <= 1.22 binaries read "socks5h" as
+        # a hostname; npm and Node don't speak SOCKS) — hand out the local
+        # http:// bridge instead; the raw URL stays only as a fallback
+        unset_any = " || ".join(f'[ -z "${{{v}+x}}" ]' for v in PROXY_VARS)
+        not_expired = ('[ -z "${AGY_PROXY_EXPIRES:-}" ] || '
+                       '[ "$(date +%s)" -lt "$AGY_PROXY_EXPIRES" ]')
+        cmd = f"{shlex.quote(sys.executable)} {shlex.quote(SCRIPT_PATH)} bridge ensure"
+        lines += [
+            f"  if {{ {unset_any}; }} && {{ {not_expired}; }}; then",
+            f'    if _AGY_B=$({cmd} 2>/dev/null) && [ -n "$_AGY_B" ]; then',
+            '      AGY_PROXY_URL=$_AGY_B',
+            "    else",
+            '      echo "agy-switch: local proxy bridge failed to start (see'
+            ' ~/.local/share/agy-switch/bridge.log) —" >&2',
+            '      echo "  exporting the SOCKS URL directly; tools without socks5h'
+            ' support (gh, npm, ...) may fail" >&2',
+            "    fi",
+            "    unset _AGY_B",
+            "  fi",
+        ]
     # env the user already exported (e.g. from ~/.bashrc) wins — we only fill gaps,
     # and AGY_SET tracks which variables are ours so a fallback can unset them
-    for var in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
-                "http_proxy", "https_proxy", "all_proxy"):
-        lines.append(f'  [ -z "${{{var}+x}}" ] && {{ export {var}={shlex.quote(url)};'
+    for var in PROXY_VARS:
+        lines.append(f'  [ -z "${{{var}+x}}" ] && {{ export {var}="$AGY_PROXY_URL";'
                      f' AGY_SET="$AGY_SET {var}"; }}')
     # agy's OAuth login callback listens on localhost — never proxy that
     for var in ("NO_PROXY", "no_proxy"):
         lines.append(f"  export {var}=localhost,127.0.0.1,::1")
+    lines.append("  unset AGY_PROXY_URL")
     lines.append("fi")
     os.makedirs(STORE, exist_ok=True)
     tmp = f"{PROXY_ENV}.tmp.{os.getpid()}"
@@ -1517,10 +1571,459 @@ def apply_proxy_to_self():
     if state != "on":
         return  # off or expired — stay direct so the tool itself keeps working
     url = proxy_url(cfg)
-    for var in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
-                "http_proxy", "https_proxy", "all_proxy"):
+    for var in PROXY_VARS:
         os.environ[var] = url
     os.environ["NO_PROXY"] = os.environ["no_proxy"] = "localhost,127.0.0.1,::1"
+
+
+# ---------------------------------------------------------------- socks bridge
+#
+# A SOCKS proxy can't just be exported as socks5h://: the shim's environment is
+# inherited by everything agy runs, and many tools can't use that scheme from
+# HTTP(S)_PROXY — gh and other binaries built with Go <= 1.22 parse "socks5h"
+# as a hostname ("error connecting to socks5h"), npm and Node's fetch don't
+# speak SOCKS at all. For SOCKS upstreams the shim therefore exports a local
+# plain-HTTP proxy (every client understands http://) that forwards each
+# CONNECT / absolute-URI request through the SOCKS upstream, always handing it
+# the hostname (remote DNS, exactly like socks5h).
+#
+# - listens on 127.0.0.1 only and requires a random per-install token as proxy
+#   credentials (http://agy-switch:<token>@127.0.0.1:<port>) — on a shared host
+#   other local users must not ride this user's proxy
+# - port and token persist in bridge.json, so a restarted bridge answers at the
+#   very URL long-running agy sessions already carry in their environment
+# - re-reads proxy.json when it changes: switching between SOCKS proxies takes
+#   effect without restarting agy; switching to a non-SOCKS proxy (or off)
+#   keeps the last SOCKS upstream for the sessions that still point here
+# - exits after BRIDGE_IDLE seconds without connections while no agy runs; the
+#   next agy start brings it back (`bridge ensure`, called from proxy.env)
+# - the upstream credentials stay in proxy.json — child processes only ever
+#   see the local token
+
+BRIDGE_FILE = os.path.join(STORE, "bridge.json")
+BRIDGE_LOCK = os.path.join(STORE, ".bridge.lock")
+BRIDGE_LOG = os.path.join(STORE, "bridge.log")
+BRIDGE_PING_HOST = "agy-switch.bridge"  # magic absolute-URI host: liveness check
+BRIDGE_IDLE = 600
+SOCKS_PROTOCOLS = ("socks5", "socks5h")
+SCRIPT_PATH = os.path.realpath(__file__)
+SOCKS_REPLIES = {1: "general failure", 2: "not allowed by ruleset", 3: "network unreachable",
+                 4: "host unreachable", 5: "connection refused", 6: "TTL expired",
+                 7: "command not supported", 8: "address type not supported"}
+
+
+def is_socks(cfg):
+    return bool(cfg) and str(cfg.get("protocol") or "").lower() in SOCKS_PROTOCOLS
+
+
+def bridge_state():
+    return load_json(BRIDGE_FILE) or {}
+
+
+def bridge_url(st):
+    return f"http://{BRIDGE_USER}:{st['token']}@127.0.0.1:{st['port']}"
+
+
+def _bridge_auth(token):
+    return base64.b64encode(f"{BRIDGE_USER}:{token}".encode()).decode()
+
+
+def bridge_ping(st, timeout=1.5):
+    """True when OUR bridge (accepting st's token) answers at st's port."""
+    if not st.get("port") or not st.get("token"):
+        return False
+    try:
+        with socket.create_connection(("127.0.0.1", int(st["port"])), timeout=timeout) as s:
+            s.settimeout(timeout)
+            s.sendall((f"GET http://{BRIDGE_PING_HOST}/ping HTTP/1.1\r\n"
+                       f"Host: {BRIDGE_PING_HOST}\r\n"
+                       f"Proxy-Authorization: Basic {_bridge_auth(st['token'])}\r\n"
+                       "Connection: close\r\n\r\n").encode())
+            data = b""
+            while len(data) < 4096:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+        return data.startswith(b"HTTP/1.1 200") and b"agy-switch-bridge" in data
+    except (OSError, ValueError):
+        return False
+
+
+def _recv_exact(s, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = s.recv(n - len(buf))
+        if not chunk:
+            raise OSError("SOCKS proxy closed the connection during the handshake")
+        buf += chunk
+    return buf
+
+
+def socks5_connect(cfg, host, port, timeout=20):
+    """Open a TCP stream to host:port through the SOCKS5 proxy cfg (RFC 1928,
+    username/password per RFC 1929). Hostnames go to the proxy unresolved."""
+    import ipaddress
+    s = socket.create_connection((cfg["host"], int(cfg["port"])), timeout=timeout)
+    try:
+        user, pw = (cfg.get("username") or "").encode(), (cfg.get("password") or "").encode()
+        s.sendall(b"\x05\x02\x00\x02" if user else b"\x05\x01\x00")
+        ver, method = _recv_exact(s, 2)
+        if ver != 5:
+            raise OSError("upstream is not a SOCKS5 proxy")
+        if method == 2:
+            if len(user) > 255 or len(pw) > 255:
+                raise OSError("SOCKS5 username/password longer than 255 bytes")
+            s.sendall(b"\x01" + bytes([len(user)]) + user + bytes([len(pw)]) + pw)
+            if _recv_exact(s, 2)[1] != 0:
+                raise OSError("SOCKS5 proxy rejected the username/password")
+        elif method != 0:
+            raise OSError("SOCKS5 proxy accepts none of our auth methods")
+        try:
+            ip = ipaddress.ip_address(host)
+            addr = (b"\x01" if ip.version == 4 else b"\x04") + ip.packed
+        except ValueError:
+            try:
+                h = host.encode("idna")
+            except UnicodeError:
+                raise OSError(f"invalid hostname {host!r}")
+            if not h or len(h) > 255:
+                raise OSError(f"invalid hostname {host!r}")
+            addr = b"\x03" + bytes([len(h)]) + h
+        s.sendall(b"\x05\x01\x00" + addr + int(port).to_bytes(2, "big"))
+        _ver, rep, _rsv, atyp = _recv_exact(s, 4)
+        if rep != 0:
+            raise OSError(f"SOCKS5 connect to {host}:{port} failed: "
+                          f"{SOCKS_REPLIES.get(rep, f'error {rep}')}")
+        n = {1: 4, 4: 16}.get(atyp)
+        if n is None:
+            if atyp != 3:
+                raise OSError("malformed SOCKS5 reply")
+            n = _recv_exact(s, 1)[0]
+        _recv_exact(s, n + 2)  # bound address + port: unused
+        s.settimeout(None)
+        return s
+    except BaseException:
+        s.close()
+        raise
+
+
+def _split_hostport(target):
+    """'host:port' / '[v6]:port' -> (host, port) or (None, None)."""
+    if target.startswith("["):
+        host, _, tail = target[1:].partition("]")
+        port = tail[1:] if tail.startswith(":") else ""
+    else:
+        host, _, port = target.rpartition(":")
+    try:
+        port = int(port)
+    except ValueError:
+        return None, None
+    if not host or not 0 < port < 65536:
+        return None, None
+    return host, port
+
+
+def _agy_alive():
+    """Is any agy running? Errs on the side of yes (keeps the bridge up)."""
+    try:
+        r = subprocess.run(["pgrep", "-f", r"(^|/)agy( |$)|agy[.]real"],
+                           capture_output=True, text=True)
+    except Exception:
+        return True
+    return r.returncode != 1  # 1 = no match; 0 = match; >1 = pgrep error
+
+
+class _Bridge:
+    HOP_HEADERS = ("proxy-authorization", "proxy-connection", "connection", "keep-alive")
+    REASONS = {200: "OK", 400: "Bad Request", 407: "Proxy Authentication Required",
+               431: "Request Header Fields Too Large", 502: "Bad Gateway"}
+
+    def __init__(self, token):
+        self.auth = _bridge_auth(token).encode()
+        self.lock = threading.Lock()
+        self.active, self.last = 0, time.time()
+        self.cfg, self.cfg_name, self.cfg_mtime = None, None, None
+
+    def log(self, msg):
+        try:
+            with open(BRIDGE_LOG, "a") as f:
+                f.write(f"{datetime.now().isoformat(timespec='seconds')} {msg}\n")
+        except OSError:
+            pass
+
+    def upstream(self):
+        """Active SOCKS proxy, re-read whenever proxy.json changes. When the active
+        proxy is off or not SOCKS, keep serving the last SOCKS entry (re-read by
+        name, so edits to it still apply) for sessions that still point here."""
+        try:
+            mtime = os.stat(PROXY_FILE).st_mtime_ns
+        except OSError:
+            mtime = None
+        with self.lock:
+            if mtime != self.cfg_mtime:
+                self.cfg_mtime = mtime
+                try:
+                    db = load_proxy_db()
+                    name, cfg, _s = active_proxy(db)
+                    if not is_socks(cfg) and self.cfg_name:
+                        name, cfg = self.cfg_name, db.get("proxies", {}).get(self.cfg_name)
+                except Exception:
+                    name, cfg = None, None
+                if is_socks(cfg):
+                    self.cfg, self.cfg_name = dict(cfg), name
+            return self.cfg
+
+    def reply(self, c, code, msg, extra=""):
+        body = (msg + "\n").encode()
+        try:
+            c.sendall(f"HTTP/1.1 {code} {self.REASONS[code]}\r\n{extra}"
+                      f"Content-Type: text/plain\r\nContent-Length: {len(body)}\r\n"
+                      "Connection: close\r\n\r\n".encode() + body)
+        except OSError:
+            pass
+
+    def authorized(self, headers):
+        for h in headers:
+            name, _, value = h.partition(":")
+            if name.strip().lower() == "proxy-authorization":
+                scheme, _, cred = value.strip().partition(" ")
+                return (scheme.lower() == "basic"
+                        and hmac.compare_digest(cred.strip().encode("latin-1"), self.auth))
+        return False
+
+    def open_upstream(self, c, host, port):
+        cfg = self.upstream()
+        if not cfg:
+            self.reply(c, 502, "agy-switch bridge: no SOCKS proxy configured")
+            return None
+        try:
+            return socks5_connect(cfg, host, port)
+        except OSError as e:
+            self.log(f"{host}:{port}: {e}")
+            self.reply(c, 502, f"agy-switch bridge: {e}")
+            return None
+
+    def handle(self, c):
+        with self.lock:
+            self.active += 1
+        up = None
+        try:
+            c.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            c.settimeout(30)
+            buf = b""
+            while b"\r\n\r\n" not in buf:
+                if len(buf) > 65536:
+                    return self.reply(c, 431, "request head too large")
+                chunk = c.recv(65536)
+                if not chunk:
+                    return
+                buf += chunk
+            head, _, rest = buf.partition(b"\r\n\r\n")
+            lines = head.decode("latin-1").split("\r\n")
+            parts = lines[0].split()
+            if len(parts) != 3:
+                return self.reply(c, 400, "malformed request line")
+            method, target, version = parts
+            headers = lines[1:]
+            if not self.authorized(headers):
+                return self.reply(c, 407, "agy-switch bridge: proxy authentication required",
+                                  'Proxy-Authenticate: Basic realm="agy-switch"\r\n')
+            if method.upper() == "CONNECT":
+                host, port = _split_hostport(target)
+                if not host:
+                    return self.reply(c, 400, f"bad CONNECT target {target!r}")
+                up = self.open_upstream(c, host, port)
+                if not up:
+                    return
+                c.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+            else:  # plain http:// request in absolute-URI form
+                try:
+                    u = urllib.parse.urlsplit(target)
+                    host, port = u.hostname, u.port or 80
+                except ValueError:
+                    return self.reply(c, 400, f"bad request target {target!r}")
+                if host == BRIDGE_PING_HOST:
+                    return self.reply(c, 200, f"agy-switch-bridge {os.getpid()}")
+                if u.scheme.lower() != "http" or not host:
+                    return self.reply(c, 400, "expected CONNECT or an absolute http:// URL")
+                up = self.open_upstream(c, host, port)
+                if not up:
+                    return
+                path = (u.path or "/") + (f"?{u.query}" if u.query else "")
+                keep = [h for h in headers
+                        if h.partition(":")[0].strip().lower() not in self.HOP_HEADERS]
+                # one request per upstream connection — the next request may be
+                # for another host, so the client must not reuse this one
+                rest = (f"{method} {path} {version}\r\n" + "".join(h + "\r\n" for h in keep)
+                        + "Connection: close\r\n\r\n").encode("latin-1") + rest
+            if rest:
+                up.sendall(rest)
+            up.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            c.settimeout(None)
+            self.pipe(c, up)
+        except OSError:
+            pass
+        finally:
+            for s in (c, up):
+                if s is not None:
+                    try:
+                        s.close()
+                    except OSError:
+                        pass
+            with self.lock:
+                self.active -= 1
+                self.last = time.time()
+
+    @staticmethod
+    def pipe(a, b):
+        """Copy both directions until each side has closed its half."""
+        def copy(src, dst):
+            try:
+                while True:
+                    data = src.recv(65536)
+                    if not data:
+                        break
+                    dst.sendall(data)
+            except OSError:
+                pass
+            finally:
+                try:
+                    dst.shutdown(socket.SHUT_WR)
+                except OSError:
+                    pass
+        t = threading.Thread(target=copy, args=(b, a), daemon=True)
+        t.start()
+        copy(a, b)
+        t.join()
+
+    def idle_watch(self):
+        while True:
+            time.sleep(60)
+            with self.lock:
+                idle = self.active == 0 and time.time() - self.last >= BRIDGE_IDLE
+            if idle and not _agy_alive():
+                self.log("idle and no agy running — exiting")
+                os._exit(0)
+
+
+def _listen(port):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("127.0.0.1", port))
+        s.listen(128)
+        return s
+    except OSError:
+        s.close()
+        raise
+
+
+def bridge_run():
+    """Serve the bridge in the foreground (`bridge ensure` daemonizes this)."""
+    os.makedirs(STORE, exist_ok=True)
+    st = bridge_state()
+    token = st.get("token") or secrets.token_urlsafe(24)
+    try:
+        srv = _listen(int(st.get("port") or 0))
+    except OSError:
+        if bridge_ping(st):
+            return 0  # another bridge already serves this URL
+        srv = _listen(0)  # port taken by something else — sessions must restart
+    br = _Bridge(token)
+    if not br.upstream():
+        br.log("no SOCKS proxy is active — not starting")
+        return 1
+    port = srv.getsockname()[1]
+    write_json_atomic(BRIDGE_FILE, {"port": port, "token": token, "pid": os.getpid(),
+                                    "started": int(time.time())})
+    br.log(f"listening on 127.0.0.1:{port} (pid {os.getpid()})")
+    threading.Thread(target=br.idle_watch, daemon=True).start()
+    while True:
+        try:
+            c, _ = srv.accept()
+        except OSError:
+            time.sleep(0.1)  # e.g. EMFILE — keep serving
+            continue
+        threading.Thread(target=br.handle, args=(c,), daemon=True).start()
+
+
+def _pid_is_bridge(pid):
+    try:
+        cmd = subprocess.run(["ps", "-o", "command=", "-p", str(int(pid))],
+                             capture_output=True, text=True).stdout
+    except Exception:
+        return False
+    return "agy-switch" in cmd and "bridge run" in cmd
+
+
+def bridge_ensure(timeout=5):
+    """Start the bridge unless it already answers; return its URL or None."""
+    import fcntl
+    if not is_socks(active_proxy()[1]):
+        return None
+    os.makedirs(STORE, exist_ok=True)
+    with open(BRIDGE_LOCK, "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)  # concurrent agy starts spawn one bridge
+        st = bridge_state()
+        if bridge_ping(st):
+            return bridge_url(st)
+        if st.get("pid") and _pid_is_bridge(st["pid"]):
+            try:  # alive but not answering — replace it
+                os.kill(int(st["pid"]), signal.SIGTERM)
+                time.sleep(0.2)
+            except OSError:
+                pass
+        env = {k: v for k, v in os.environ.items()
+               if k.lower() not in ("http_proxy", "https_proxy", "all_proxy")}
+        try:
+            big = os.path.getsize(BRIDGE_LOG) > 1024 * 1024
+        except OSError:
+            big = False
+        with open(BRIDGE_LOG, "w" if big else "a") as log:
+            p = subprocess.Popen([sys.executable, SCRIPT_PATH, "bridge", "run"],
+                                 stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                                 cwd="/", env=env, close_fds=True, start_new_session=True)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            st = bridge_state()
+            if bridge_ping(st, timeout=0.5):
+                return bridge_url(st)
+            if p.poll() not in (None, 0):
+                return None
+            time.sleep(0.05)
+    return None
+
+
+def bridge_status_line():
+    st = bridge_state()
+    if bridge_ping(st):
+        return f"running on 127.0.0.1:{st['port']} (pid {st.get('pid')})"
+    return "not running (the next agy start launches it)"
+
+
+def cmd_bridge(args):
+    action = args[0] if args else "status"
+    if action == "run":
+        sys.exit(bridge_run())
+    elif action == "ensure":
+        # stdout is the URL proxy.env exports — it carries the local bridge
+        # token only, never an OAuth token or the upstream credentials
+        url = bridge_ensure()
+        if not url:
+            sys.exit(1)
+        print(url)
+    elif action == "status":
+        print(f"bridge: {bridge_status_line()}")
+    elif action == "stop":
+        st = bridge_state()
+        if bridge_ping(st) and st.get("pid"):
+            os.kill(int(st["pid"]), signal.SIGTERM)
+            print("bridge stopped — running agy sessions lose the proxy until the next agy start")
+        else:
+            print("bridge: not running")
+    else:
+        die("usage: agy-switch bridge [status|stop]")
 
 
 GEO_URL = os.environ.get("AGY_SWITCH_GEO_URL", "https://api.country.is")
@@ -1921,6 +2424,8 @@ def proxy_status(db):
               + (f"\n  exit: {seen}" if seen else ""))
     shim = db.get("shim_path", "")
     print(f"shim: {'installed at ' + shim if shim and is_shim(shim) else 'NOT active'}")
+    if is_socks(active_proxy(db)[1]):
+        print(f"bridge: {bridge_status_line()}")
     net, cc = net_ok()
     net_s = {"ok": f"{GREEN}ok{RESET}" + (f" (exit region: {cc})" if cc else ""),
              "blocked": f"{RED}Google API unreachable{RESET}",
@@ -2320,17 +2825,24 @@ Usage:
                           manage proxies that agy runs through — no argument:
                           interactive manager (enable/edit/delete, exit-region
                           and hosting/residential probe per proxy)
+  agy-switch bridge [status|stop]
+                          the local http:// bridge that stands in for a SOCKS
+                          proxy (started automatically by agy)
 
 Tokens never appear on a command line or in this tool's output."""
 
 
 def main():
+    if sys.argv[1:2] == ["bridge"]:
+        # fast path: proxy.env runs `bridge ensure` on every agy start
+        return cmd_bridge(sys.argv[2:])
     if os.path.isdir(OLD_STORE) and not os.path.exists(STORE):
         os.rename(OLD_STORE, STORE)
     db = load_proxy_db()
     if db.get("proxies") or db.get("shim_path"):
         try:
             install_shim(db)  # repair the shim if `agy update` replaced it
+            write_proxy_env(db)  # keep proxy.env in step with this version's shim
         except Exception:
             pass
     apply_proxy_to_self()
