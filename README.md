@@ -20,9 +20,9 @@
 
 ## Requirements
 
-- Linux or macOS
-- Python 3.7+ (preinstalled on most systems)
-- `curl` (used for proxy probing and protocol detection)
+- Linux, macOS or Windows 10+
+- Python 3.7+ (preinstalled on most Linux/macOS systems; on Windows: `winget install Python.Python.3.12`)
+- `curl` (used for proxy probing and protocol detection; ships with Windows 10+)
 - [Antigravity CLI](https://github.com/google/antigravity) itself
 
 ## Install
@@ -39,7 +39,13 @@ npm install -g agy-switch
 curl -fsSL https://raw.githubusercontent.com/ZhangNy301/agy-switch/main/install.sh | bash
 ```
 
-Both give you two commands: `agy-switch` and its short alias `asw`. Make sure `~/.local/bin` is on your `PATH` (the installer tells you if it isn't).
+**Windows (PowerShell, no Node.js needed):**
+
+```powershell
+irm https://raw.githubusercontent.com/elhassu/agy-switch/main/install.ps1 | iex
+```
+
+All of these give you two commands: `agy-switch` and its short alias `asw`. On Linux/macOS make sure `~/.local/bin` is on your `PATH` (the installer tells you if it isn't); the Windows installer puts `%LOCALAPPDATA%\agy-switch\bin` on your user `PATH` itself.
 
 ## Quick start
 
@@ -81,6 +87,13 @@ Add flow asks only for `server`, `port`, `username?`, `password?` — the protoc
 - **SOCKS proxies go through a local bridge.** Everything agy runs (its shell commands, `gh`, `git`, `npm`, …) inherits the proxy variables, and many tools can't use a `socks5h://` URL from them — `gh` and other binaries built with Go ≤ 1.22 fail with `error connecting to socks5h`, npm and Node don't speak SOCKS at all. So for a SOCKS proxy the shim exports `http://agy-switch:<token>@127.0.0.1:<port>` instead: a small HTTP proxy, started on demand, that forwards every request through your SOCKS proxy with remote DNS (like `socks5h`). It listens on localhost only, requires a random per-install token (other users on a shared host can't use your proxy), keeps the same port across restarts, picks up proxy edits without restarting agy, and exits once idle with no agy running. Your SOCKS credentials never appear in child processes' environment. `agy-switch bridge status` / `stop` inspect it; its log is `~/.local/share/agy-switch/bridge.log`.
 - Quotas are read from agy's local state and refreshed in the background; cached values are shown when refresh fails.
 
+### Windows
+
+- agy keeps its login in the **Windows Credential Manager** (generic credential `gemini:antigravity`); agy-switch reads and writes that item directly. Like agy itself, it stores `id_token_email` there instead of the full `id_token`, which keeps the item under Credential Manager's 2560-byte limit.
+- Data lives in `%USERPROFILE%\.local\share\agy-switch\`.
+- Proxy shim: `agy.exe` is renamed to `agy.real.exe`, and an `agy.cmd` beside it does what the bash shim does on Linux/macOS (proxy env, expiry, network check, account re-assert, SOCKS bridge). When an agy update puts a fresh `agy.exe` back, the next `agy-switch` run moves it behind the shim again.
+- Use Windows Terminal, PowerShell or `cmd`. Git Bash's mintty isn't a real console, so the interactive picker won't start there — use `agy-switch ls` / `agy-switch use <name>` instead.
+
 ## Uninstall
 
 ```bash
@@ -88,6 +101,16 @@ agy-switch proxy off            # stop injecting the proxy
 npm uninstall -g agy-switch     # or: rm ~/.local/bin/agy-switch ~/.local/bin/asw
 rm -rf ~/.local/share/agy-switch
 # if ~/.local/bin/agy is the agy-switch shim, remove it too (it says so in its header)
+```
+
+On Windows (PowerShell):
+
+```powershell
+agy-switch proxy off
+$bin = "$env:LOCALAPPDATA\agy\bin"   # wherever agy.exe lives
+if (Test-Path "$bin\agy.real.exe") { Remove-Item "$bin\agy.cmd"; Rename-Item "$bin\agy.real.exe" agy.exe }
+npm uninstall -g agy-switch          # or: Remove-Item -Recurse "$env:LOCALAPPDATA\agy-switch"
+Remove-Item -Recurse "$env:USERPROFILE\.local\share\agy-switch"
 ```
 
 ## Contributing

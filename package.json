@@ -1,7 +1,7 @@
 {
   "name": "agy-switch",
   "version": "1.0.6",
-  "description": "Multi-account manager for Antigravity CLI (agy): switch Google accounts, view model quotas, and route agy through managed proxies",
+  "description": "Multi-account manager for Antigravity CLI (agy) on Linux, macOS and Windows: switch Google accounts, view model quotas, and route agy through managed proxies",
   "keywords": [
     "agy",
     "antigravity",
@@ -26,13 +26,15 @@
   "files": [
     "bin/agy-switch",
     "lib/launcher.js",
-    "install.sh"
+    "install.sh",
+    "install.ps1"
   ],
   "engines": {
     "node": ">=14"
   },
   "os": [
     "linux",
-    "darwin"
+    "darwin",
+    "win32"
   ]
 }

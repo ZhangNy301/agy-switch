@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+- **Windows support.** agy on Windows keeps its login in the Credential
+  Manager (`gemini:antigravity`, raw token JSON with `id_token_email`).
+  agy-switch now reads and writes that item through `advapi32`. Writes drop
+  the bulky `id_token`, so the item stays under the 2560-byte cap.
+- Interactive picker and proxy manager run on the Windows console (msvcrt
+  key input, ANSI turned on, UTF-8 output)
+- Proxy shim on Windows: `agy.exe` → `agy.real.exe` plus an `agy.cmd` that
+  runs a Python port of the bash shim; repaired after agy updates
+- SOCKS bridge on Windows: detached spawn, msvcrt file lock, exclusive port
+  bind, and a process check via CIM
+- `asw` → Enter on Windows runs agy and waits (exec there would leave the
+  shell and agy fighting over the console)
+- npm launcher finds Python via `py -3` on Windows; new `install.ps1`
+- Emails now also come from `id_token_email` when a token has no `id_token`
+- curl probes use the platform null device (System32 `curl.exe` can't write
+  `/dev/null`)
+- CI smoke tests on Linux, macOS and Windows (`tests/`)
+
 ## 1.0.6
 
 - Fix tools run inside agy breaking behind a SOCKS proxy. The shim exported
