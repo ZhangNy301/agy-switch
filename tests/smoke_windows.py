@@ -90,28 +90,87 @@ try:
     m._wincred_write(json.dumps(tok("a@example.com", "rt-a", with_id=False)))
     check("clobber detected", m.live_was_clobbered())
 
-    # --- agy.cmd shim ------------------------------------------------------
+    # a refused Credential Manager write stops the switch instead of silently
+    # writing a token file that agy on Windows never reads
+    before = m.refresh_token_of(m.kc_read_cred()[0])  # "a", from the clobber check above
+    real_write = m._wincred_write
+    m._wincred_write = lambda secret: (1, "simulated failure")
+    try:
+        m.switch_to("b")
+        check("refused write raises", False)
+    except m.CredentialStoreError:
+        check("refused write raises", True)
+    finally:
+        m._wincred_write = real_write
+    check("refused write changed nothing", before == "rt-a"
+          and m.refresh_token_of(m.kc_read_cred()[0]) == "rt-a"
+          and not os.path.isfile(m.LIVE))
+    m.switch_to("b")
+
+    # --- agy.exe shim (pip's launcher) -----------------------------------------
+    shim_exe = os.path.join(AGYBIN, "agy.exe")
+    real_exe = os.path.join(AGYBIN, "agy.real.exe")
     m.save_proxy_db({"version": 2, "active": None, "proxies": {
         "p1": {"protocol": "http", "host": "127.0.0.1", "port": 9}}})
     check("proxy on", asw("proxy", "on", "p1")[0] == 0)
-    check("agy.exe moved to agy.real.exe", os.path.isfile(os.path.join(AGYBIN, "agy.real.exe"))
-          and not os.path.exists(os.path.join(AGYBIN, "agy.exe")))
-    check("agy resolves to the shim", shutil.which("agy").lower().endswith("agy.cmd"))
+    check("agy.exe moved to agy.real.exe", os.path.isfile(real_exe) and not m.is_shim(real_exe))
+    check("agy.exe is now the shim", m.is_shim(shim_exe)
+          and shutil.which("agy").lower().endswith("agy.exe"))
     rc, out = agy("set HTTPS_PROXY & set NO_PROXY & exit 7")
     check("shim injects the proxy", "HTTPS_PROXY=http://127.0.0.1:9" in out)
     check("shim sets NO_PROXY", "NO_PROXY=localhost" in out)
     check("shim passes the exit code", rc == 7)
     check("shim re-asserted account b",
           m.refresh_token_of(m.kc_read_cred()[0]) == "rt-b")
+    # Node's spawn and Python's subprocess can't start a .cmd without a shell
+    r = subprocess.run(["agy", "/c", "exit 3"], capture_output=True, timeout=120)
+    check("shim starts without a shell", r.returncode == 3)
+    r = subprocess.run(["agy", "/c", "echo", "two words", "&&", "exit", "0"],
+                       capture_output=True, text=True, timeout=120)
+    check("shim keeps arguments intact", "two words" in r.stdout)
     asw("proxy", "off")
     check("proxy off: no injection", "127.0.0.1:9" not in agy("set HTTPS_PROXY")[1])
-    shutil.copy(os.path.join(os.environ["WINDIR"], "System32", "cmd.exe"),
-                os.path.join(AGYBIN, "agy.exe"))  # simulated `agy update`
+    shutil.copy(os.path.join(os.environ["WINDIR"], "System32", "cmd.exe"), shim_exe)  # `agy update`
     asw("proxy", "status")
     check("repair moves an updated agy.exe behind the shim",
-          not os.path.exists(os.path.join(AGYBIN, "agy.exe")))
+          m.is_shim(shim_exe) and not m.is_shim(real_exe) and os.path.isfile(real_exe))
+    check("one agy-switch shim, no stray agy.cmd",
+          not os.path.exists(os.path.join(AGYBIN, "agy.cmd")))
+
+    # --- agy.cmd fallback when pip's launcher is missing ------------------------
+    db = m.load_proxy_db()
+    real_launcher = m._win_launcher
+    m._win_launcher = lambda: None
+    try:
+        cfg = m.install_shim_win(db)
+    finally:
+        m._win_launcher = real_launcher
+    cmd_shim = os.path.join(AGYBIN, "agy.cmd")
+    check("fallback writes agy.cmd and removes the exe shim",
+          cfg and cfg["shim_path"] == cmd_shim and m.is_shim(cmd_shim) and not os.path.exists(shim_exe))
+    with open(cmd_shim, "rb") as f:
+        check("agy.cmd is plain ASCII", all(b < 128 for b in f.read()))
+    check("fallback shim runs", agy("exit 5")[0] == 5)
+    m.install_shim_win(m.load_proxy_db())
+    check("upgrading back to the exe shim removes agy.cmd",
+          m.is_shim(shim_exe) and not os.path.exists(cmd_shim))
 finally:
     m.kc_delete()
+
+# --- paths and scanning ---------------------------------------------------------
+accented = os.path.join(SANDBOX, "José")
+os.makedirs(accented)
+short = m.win_short_path(accented)
+if short == accented:
+    print("SKIP short path for a non-ASCII folder (8.3 names are disabled on this volume)")
+else:
+    check("short path for a non-ASCII folder", short.isascii() and os.path.isdir(short))
+blob = os.path.join(SANDBOX, "fake-agy.bin")
+with open(blob, "wb") as f:
+    f.write(b"\x00123456789012-abcdefghijklmnopqrstuvwxyz012345.apps.googleusercontent.com"
+            b"GOCSPX-" + b"A" * 28 + b"trailingGoString\x00")
+got = m._scan_oauth_strings(blob)
+check("secret cut to its fixed length", got["secret"] == ["GOCSPX-" + "A" * 28])
 
 
 # --- SOCKS bridge ------------------------------------------------------------

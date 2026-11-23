@@ -8,13 +8,25 @@
   the bulky `id_token`, so the item stays under the 2560-byte cap.
 - Interactive picker and proxy manager run on the Windows console (msvcrt
   key input, ANSI turned on, UTF-8 output)
-- Proxy shim on Windows: `agy.exe` → `agy.real.exe` plus an `agy.cmd` that
-  runs a Python port of the bash shim; repaired after agy updates
+- Proxy shim on Windows: `agy.exe` → `agy.real.exe`, with a small `agy.exe`
+  launcher in its place (pip's console-script launcher) that runs a Python
+  port of the bash shim, so tools that start `agy` without a shell keep
+  working; falls back to `agy.cmd` without pip; repaired after agy updates.
+  Shims start Python via `py -3` when available, and use 8.3 short paths in
+  `.cmd` files so non-ASCII user folders work
+- Switching stops with an error if the Credential Manager refuses the write,
+  instead of falling back to a token file agy on Windows doesn't read
+- Fix: client secrets scanned from the agy binary are cut to their fixed
+  length (`GOCSPX-` + 28). The open-ended match picked up trailing bytes on
+  Windows builds, so every token refresh failed with `invalid_client`
+- Switching no longer carries the previous account's `id_token` /
+  `id_token_email` over when the new profile has none (all platforms)
 - SOCKS bridge on Windows: detached spawn, msvcrt file lock, exclusive port
   bind, and a process check via CIM
 - `asw` → Enter on Windows runs agy and waits (exec there would leave the
   shell and agy fighting over the console)
-- npm launcher finds Python via `py -3` on Windows; new `install.ps1`
+- npm launcher finds Python via `py -3` on Windows; new `install.ps1`, which
+  updates the user `PATH` in the registry without flattening `%VAR%` entries
 - Emails now also come from `id_token_email` when a token has no `id_token`
 - curl probes use the platform null device (System32 `curl.exe` can't write
   `/dev/null`)

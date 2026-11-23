@@ -142,7 +142,7 @@ def real_agy_binary():
     cands = [agy, agy + ".real" if agy else None,
              os.path.expanduser("~/.local/bin/agy.real")]
     if IS_WIN:
-        # the Windows shim is agy.cmd beside agy.real.exe (see install_shim)
+        # the Windows shim (agy.exe, or agy.cmd) sits beside agy.real.exe (see install_shim_win)
         local = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~/AppData/Local")
         cands += [os.path.splitext(agy)[0] + ".real.exe" if agy else None,
                   (load_json(PROXY_FILE) or {}).get("real_path"),
@@ -157,7 +157,10 @@ def real_agy_binary():
 def _scan_oauth_strings(path):
     """All client-id / client-secret strings found in the agy binary."""
     pats = {"id": re.compile(rb"\d{6,}-[a-z0-9]+\.apps\.googleusercontent\.com"),
-            "secret": re.compile(rb"GOCSPX-(?:(?!GOCSPX-)[A-Za-z0-9_\-])+")}
+            # Google client secrets are always GOCSPX- plus 28 characters. Fix the
+            # length: binaries pack strings back to back, and an open-ended match
+            # runs into whatever follows (seen on Windows builds of agy)
+            "secret": re.compile(rb"GOCSPX-[A-Za-z0-9_\-]{28}")}
     got = {"id": [], "secret": []}
     tail, eof = b"", False
     with open(path, "rb") as f:
@@ -811,6 +814,10 @@ def live_cred():
     return LIVE, None, "nested"
 
 
+class CredentialStoreError(Exception):
+    """The OS credential store refused a write that agy-switch can't route around."""
+
+
 def write_live(nested, loc, style):
     """Write the live credential where agy reads it. On macOS that is the
     keychain; an existing token file is kept in sync as a mirror (an agy started
@@ -821,6 +828,12 @@ def write_live(nested, loc, style):
             if os.path.isfile(LIVE):
                 write_json_atomic(LIVE, nested)
             return
+        if IS_WIN:
+            # agy on Windows reads the Credential Manager first, so the token
+            # file would be ignored and agy would stay on the previous account
+            raise CredentialStoreError(
+                f"could not write the login to the Windows Credential Manager ({KC_DEGRADED}) — "
+                "nothing was switched")
         kc_warn()
         write_json_atomic(LIVE, nested)
         return
@@ -902,10 +915,14 @@ def count_agy_procs():
     """Number of running agy processes, or None when that can't be determined."""
     try:
         if IS_WIN:
+            # with the shim installed, agy.exe is only its launcher — every
+            # session also runs agy.real.exe, so count that alone
+            agy = shutil.which("agy")
+            images = ("agy.real.exe",) if agy and is_shim(agy) else WIN_AGY_IMAGES
             out = subprocess.run(["tasklist", "/FO", "CSV", "/NH"], capture_output=True,
                                  text=True, errors="replace", timeout=15).stdout
             return sum(1 for ln in out.splitlines()
-                       if ln.split('","', 1)[0].strip('"').lower() in WIN_AGY_IMAGES)
+                       if ln.split('","', 1)[0].strip('"').lower() in images)
         r = subprocess.run(["pgrep", "-f", r"(^|/)agy( |$)|agy[.]real"],
                            capture_output=True, text=True)
         if r.returncode > 1:  # 1 = no match; >1 = pgrep error
@@ -1145,7 +1162,7 @@ def cmd_login():
     # every agy start — exactly what this login just stashed away. Stand down.
     os.environ["AGY_SWITCH_NO_REASSERT"] = "1"
     try:
-        # which() honors PATHEXT on Windows, so the agy.cmd shim is found too
+        # which() honors PATHEXT on Windows, so an agy.cmd shim is found too
         subprocess.call([shutil.which(AGY_BIN) or AGY_BIN])
     except KeyboardInterrupt:
         pass
@@ -1789,75 +1806,177 @@ def write_proxy_env(db=None):
 
 
 def is_shim(path):
+    # shims are small (the bash script, or launcher + zip on Windows); agy is not
     try:
         if os.path.getsize(path) > 1024 * 1024:
             return False
         with open(path, "rb") as f:
-            return SHIM_MARKER.encode() in f.read(512)
+            return SHIM_MARKER.encode() in f.read()
     except OSError:
         return False
 
 
+# Windows shim, preferred form: a real agy.exe built like pip's console-script
+# wrappers (distlib's launcher + a "#!python" line + a zip with __main__.py).
+# Unlike a .cmd it can be started by anything that runs `agy` without a shell
+# (Node's spawn, Python's subprocess, editors), keeps multi-line arguments, and
+# never leaves cmd's "Terminate batch job (Y/N)?" prompt after Ctrl-C.
+WIN_SHIM_MAIN = """# @MARKER@ - managed by `agy-switch proxy`
+import runpy, sys
+sys.argv = [@SCRIPT@, "__shim", @REAL@] + sys.argv[1:]
+runpy.run_path(@SCRIPT@, run_name="__main__")
+"""
+
+# Fallback when pip's launcher isn't available: agy.cmd beside agy.real.exe.
 WIN_SHIM_TEMPLATE = """@echo off
 rem @MARKER@ - managed by `agy-switch proxy`; the real binary is @REAL@
-"@PY@" "@SCRIPT@" __shim "@REAL@" %*
+@PY@ "@SCRIPT@" __shim "@REAL@" %*
 exit /b %ERRORLEVEL%
 """
 
 
+def _win_launcher():
+    """Bytes of pip's console-script launcher for this Python, or None."""
+    import importlib.util
+    import sysconfig
+    try:
+        spec = importlib.util.find_spec("pip")
+    except (ImportError, ValueError):
+        return None
+    if not spec or not spec.submodule_search_locations:
+        return None
+    arch = sysconfig.get_platform().rsplit("-", 1)[-1]  # win-amd64 / win-arm64 / win32
+    name = {"amd64": "t64.exe", "arm64": "t64-arm.exe"}.get(arch, "t32.exe")
+    path = os.path.join(list(spec.submodule_search_locations)[0], "_vendor", "distlib", name)
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def win_python_command():
+    """How shims start Python. The `py` launcher survives Python upgrades; a
+    Microsoft Store Python's own path is versioned, so its stable app alias is
+    used instead; otherwise the running interpreter."""
+    py = shutil.which("py")
+    if py and py.lower().endswith(".exe"):
+        return [py, "-3"]
+    exe = sys.executable
+    if "\\windowsapps\\" in exe.lower():
+        alias = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "WindowsApps",
+                             "python3.exe")
+        if os.path.isfile(alias):
+            return [alias]
+    return [exe]
+
+
+def win_short_path(path):
+    """`path`, or its 8.3 short form when it has non-ASCII characters: .cmd files
+    are read in the console code page, which can't hold them (e.g. C:\\Users\\José)."""
+    if path.isascii():
+        return path
+    import ctypes
+    buf = ctypes.create_unicode_buffer(32768)
+    n = ctypes.windll.kernel32.GetShortPathNameW(path, buf, len(buf))
+    return buf.value if 0 < n < len(buf) and buf.value.isascii() else path
+
+
 def _cmd_quote(path):
     """A path for use inside a double-quoted .cmd argument."""
-    return path.replace("%", "%%")
+    return win_short_path(path).replace("%", "%%")
+
+
+def _shim_exe_bytes(launcher, real):
+    import io
+    import zipfile
+    cmd = win_python_command()
+    exe = cmd[0]
+    shebang = "#!" + (f'"{exe}"' if " " in exe else exe) + "".join(f" {a}" for a in cmd[1:])
+    main = (WIN_SHIM_MAIN.replace("@MARKER@", SHIM_MARKER)
+            .replace("@SCRIPT@", repr(SCRIPT_PATH)).replace("@REAL@", repr(real)))
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as z:
+        z.writestr("__main__.py", main)
+    return launcher + shebang.encode("utf-8") + b"\r\n" + buf.getvalue()
+
+
+def _write_if_changed(path, data):
+    """Write `path` atomically unless it already holds `data`. A running .exe
+    can't be overwritten but can be renamed, so a busy shim is moved aside."""
+    try:
+        with open(path, "rb") as f:
+            if f.read() == data:
+                return
+    except OSError:
+        pass
+    tmp = f"{path}.tmp.{os.getpid()}"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    try:
+        replace_file(tmp, path)
+    except OSError:
+        os.replace(path, f"{path}.old.{os.getpid()}")
+        os.replace(tmp, path)
+    folder, name = os.path.split(path)
+    for leftover in os.listdir(folder or "."):
+        if leftover.startswith(f"{name}.old."):
+            try:
+                os.remove(os.path.join(folder, leftover))
+            except OSError:
+                pass  # still running; removed on a later run
 
 
 def install_shim_win(cfg):
-    """Windows: rename agy.exe to agy.real.exe and put agy.cmd beside it. The
-    .cmd wins PATH lookup once agy.exe is gone and runs win_shim_exec. An
-    `agy update` that brings agy.exe back shadows the shim, so every run moves
-    the new binary over agy.real.exe again. Returns cfg or None."""
-    shim, real, orig = cfg.get("shim_path"), cfg.get("real_path"), cfg.get("orig_path")
-    if not (shim and real and orig):
+    """Windows: move agy.exe to agy.real.exe and put a shim in its place — an
+    agy.exe launcher (see WIN_SHIM_MAIN), or agy.cmd when pip's launcher is
+    missing. Both run win_shim_exec. An `agy update` that writes a new agy.exe
+    over the shim is moved behind it again on the next agy-switch run.
+    Returns cfg or None."""
+    real, orig = cfg.get("real_path"), cfg.get("orig_path")
+    if not (real and orig):
         found = shutil.which("agy")
         if not found:
             return None
-        base, ext = os.path.splitext(found)
-        if is_shim(found):  # installed earlier, config not saved: find the binary
-            ext = next((e for e in (".exe", ".cmd", ".bat")
-                        if os.path.isfile(f"{base}.real{e}")), None)
-            if not ext:
-                return None
-        ext = ext.lower()
-        orig, real, shim = f"{base}{ext}", f"{base}.real{ext}", f"{base}.cmd"
+        base = os.path.splitext(found)[0]
+        orig, real = f"{base}.exe", f"{base}.real.exe"
     if os.path.isfile(orig) and not is_shim(orig):
         try:
             replace_file(orig, real)
         except OSError:
-            # the old agy.real.exe is running and can't be replaced — the
-            # new agy.exe shadows the shim until the next agy-switch run
-            if not os.path.isfile(real):
-                return None
+            # the old agy.real.exe is running and can't be replaced; leave the
+            # new agy.exe in charge until the next agy-switch run
+            return cfg if os.path.isfile(real) and cfg.get("shim_path") else None
     elif not os.path.isfile(real):
         return None
-    body = (WIN_SHIM_TEMPLATE.replace("@MARKER@", SHIM_MARKER)
-            .replace("@PY@", _cmd_quote(sys.executable))
-            .replace("@SCRIPT@", _cmd_quote(SCRIPT_PATH))
-            .replace("@REAL@", _cmd_quote(real)))
-    try:
-        with open(shim, encoding="utf-8") as f:
-            unchanged = f.read() == body
-    except OSError:
-        unchanged = False
-    if not unchanged:
-        tmp = f"{shim}.tmp.{os.getpid()}"
-        with open(tmp, "w", encoding="utf-8", newline="\r\n") as f:
-            f.write(body)
-        replace_file(tmp, shim)
+    base = os.path.splitext(orig)[0]
+    legacy_cmd = f"{base}.cmd"
+    launcher = _win_launcher()
+    if launcher:
+        _write_if_changed(orig, _shim_exe_bytes(launcher, real))
+        shim = orig
+        if is_shim(legacy_cmd):  # an older agy-switch installed the .cmd form
+            try:
+                os.remove(legacy_cmd)
+            except OSError:
+                pass
+    else:
+        if os.path.isfile(orig) and is_shim(orig):
+            os.remove(orig)  # the .cmd only wins PATH lookup once agy.exe is gone
+        py = " ".join(f'"{_cmd_quote(p)}"' if i == 0 else p
+                      for i, p in enumerate(win_python_command()))
+        body = (WIN_SHIM_TEMPLATE.replace("@MARKER@", SHIM_MARKER)
+                .replace("@PY@", py)
+                .replace("@SCRIPT@", _cmd_quote(SCRIPT_PATH))
+                .replace("@REAL@", _cmd_quote(real)))
+        _write_if_changed(legacy_cmd, body.replace("\n", "\r\n").encode("ascii", "replace"))
+        shim = legacy_cmd
     cfg["shim_path"], cfg["real_path"], cfg["orig_path"] = shim, real, orig
     return cfg
 
 
 def win_shim_exec(real, args):
-    """What agy.cmd runs on Windows — the Python twin of SHIM_TEMPLATE: apply
+    """What the Windows shim runs — the Python twin of SHIM_TEMPLATE: apply
     the active proxy (env the user set wins), honor its expiry, warn about a
     blocked network or unsupported region, re-assert the account picked via
     agy-switch, then run the real agy and pass its exit code through."""
@@ -1898,6 +2017,8 @@ def win_shim_exec(real, args):
     if not os.environ.get("AGY_SWITCH_NO_REASSERT"):
         try:
             reassert_current()
+        except CredentialStoreError as e:
+            print(f"agy-switch: {e}", file=sys.stderr)
         except Exception:
             pass
     # agy shares this console and handles Ctrl-C itself; don't die before it does
@@ -3290,7 +3411,7 @@ def main():
         # fast path: proxy.env runs `bridge ensure` on every agy start
         return cmd_bridge(sys.argv[2:])
     if sys.argv[1:2] == ["__shim"] and len(sys.argv) > 2:
-        # the Windows agy.cmd shim: agy-switch __shim <real agy> [agy args...]
+        # the Windows shim (agy.exe or agy.cmd): agy-switch __shim <real agy> [agy args...]
         sys.exit(win_shim_exec(sys.argv[2], sys.argv[3:]))
     if os.path.isdir(OLD_STORE) and not os.path.exists(STORE):
         os.rename(OLD_STORE, STORE)
@@ -3355,3 +3476,5 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         sys.exit(130)
+    except CredentialStoreError as e:
+        die(str(e))

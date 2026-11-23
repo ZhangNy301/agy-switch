@@ -42,7 +42,7 @@ curl -fsSL https://raw.githubusercontent.com/ZhangNy301/agy-switch/main/install.
 **Windows (PowerShell, no Node.js needed):**
 
 ```powershell
-irm https://raw.githubusercontent.com/elhassu/agy-switch/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/ZhangNy301/agy-switch/main/install.ps1 | iex
 ```
 
 All of these give you two commands: `agy-switch` and its short alias `asw`. On Linux/macOS make sure `~/.local/bin` is on your `PATH` (the installer tells you if it isn't); the Windows installer puts `%LOCALAPPDATA%\agy-switch\bin` on your user `PATH` itself.
@@ -91,7 +91,9 @@ Add flow asks only for `server`, `port`, `username?`, `password?` — the protoc
 
 - agy keeps its login in the **Windows Credential Manager** (generic credential `gemini:antigravity`); agy-switch reads and writes that item directly. Like agy itself, it stores `id_token_email` there instead of the full `id_token`, which keeps the item under Credential Manager's 2560-byte limit.
 - Data lives in `%USERPROFILE%\.local\share\agy-switch\`.
-- Proxy shim: `agy.exe` is renamed to `agy.real.exe`, and an `agy.cmd` beside it does what the bash shim does on Linux/macOS (proxy env, expiry, network check, account re-assert, SOCKS bridge). When an agy update puts a fresh `agy.exe` back, the next `agy-switch` run moves it behind the shim again.
+- Proxy shim: `agy.exe` is renamed to `agy.real.exe`, and a small `agy.exe` launcher takes its place (built the way pip builds its console commands). It does what the bash shim does on Linux/macOS (proxy env, expiry, network check, account re-assert, SOCKS bridge), and because it is a real `.exe`, anything that starts `agy` without a shell (Node, Python, editors) keeps working. Without pip, an `agy.cmd` is used instead, which only shells and `.cmd`-aware tools can start. When an agy update writes a fresh `agy.exe` over the shim, the next `agy-switch` run moves it behind the shim again.
+- The shim and the `agy-switch` launchers start Python through the `py` launcher when it is installed, so they keep working after a Python upgrade.
+- If the Credential Manager refuses a write, the switch stops with an error: agy reads that store first, so falling back to the token file would leave agy on the previous account.
 - Use Windows Terminal, PowerShell or `cmd`. Git Bash's mintty isn't a real console, so the interactive picker won't start there — use `agy-switch ls` / `agy-switch use <name>` instead.
 
 ## Uninstall
@@ -108,7 +110,10 @@ On Windows (PowerShell):
 ```powershell
 agy-switch proxy off
 $bin = "$env:LOCALAPPDATA\agy\bin"   # wherever agy.exe lives
-if (Test-Path "$bin\agy.real.exe") { Remove-Item "$bin\agy.cmd"; Rename-Item "$bin\agy.real.exe" agy.exe }
+if (Test-Path "$bin\agy.real.exe") {
+    Remove-Item "$bin\agy.exe", "$bin\agy.cmd" -ErrorAction SilentlyContinue   # the shim
+    Rename-Item "$bin\agy.real.exe" agy.exe
+}
 npm uninstall -g agy-switch          # or: Remove-Item -Recurse "$env:LOCALAPPDATA\agy-switch"
 Remove-Item -Recurse "$env:USERPROFILE\.local\share\agy-switch"
 ```
