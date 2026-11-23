@@ -1891,7 +1891,7 @@ def _shim_exe_bytes(launcher, real):
     import io
     import zipfile
     cmd = win_python_command()
-    exe = cmd[0]
+    exe = win_short_path(cmd[0])  # keep the launcher's "#!" line plain ASCII
     shebang = "#!" + (f'"{exe}"' if " " in exe else exe) + "".join(f" {a}" for a in cmd[1:])
     main = (WIN_SHIM_MAIN.replace("@MARKER@", SHIM_MARKER)
             .replace("@SCRIPT@", repr(SCRIPT_PATH)).replace("@REAL@", repr(real)))
