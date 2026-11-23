@@ -3,7 +3,9 @@
 #
 # agy keeps one OAuth token at ~/.gemini/antigravity-cli/antigravity-oauth-token;
 # on macOS with a GUI it instead lives in the login keychain (via go-keyring:
-# service "gemini", account "antigravity", value = base64-wrapped token JSON).
+# service "gemini", account "antigravity", value = base64-wrapped token JSON);
+# on Windows it lives in the Credential Manager (generic credential
+# "gemini:antigravity", value = token JSON).
 # A "profile" is a snapshot of that credential. Switching = writing one back.
 #
 # Usage:
@@ -45,15 +47,48 @@ from datetime import datetime, timezone
 
 os.umask(0o077)
 
+IS_WIN = sys.platform == "win32"
+
+
+def _win_console_setup():
+    """Windows: turn on ANSI escape handling (Windows 10+ consoles need it
+    enabled per process) and make piped output UTF-8 so the box-drawing and
+    bar characters never raise UnicodeEncodeError on a legacy code page."""
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    for std in (-11, -12):  # STD_OUTPUT_HANDLE, STD_ERROR_HANDLE
+        h = k32.GetStdHandle(std)
+        mode = wintypes.DWORD()
+        if h and k32.GetConsoleMode(h, ctypes.byref(mode)):
+            k32.SetConsoleMode(h, mode.value | 0x0004)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+
+if IS_WIN:
+    try:
+        _win_console_setup()
+    except Exception:
+        pass
+
 AGY_BIN = os.environ.get("AGY_BIN", "agy")
 LIVE = os.path.expanduser("~/.gemini/antigravity-cli/antigravity-oauth-token")
 # gemini-cli layout — agy falls back to it when its own file is absent
 # (seen in the wild on macOS installs that predate the antigravity-cli dir)
 LEGACY_LIVE = os.path.expanduser("~/.gemini/oauth_creds.json")
-# macOS keychain item agy uses on GUI desktops (go-keyring shells out to
-# /usr/bin/security). The secret is the same nested token JSON as the file,
-# wrapped in a "go-keyring-base64:<base64>" envelope.
-KEYCHAIN_SERVICE = "gemini"
+# OS credential store item agy uses, via go-keyring:
+# - macOS GUI desktops: login keychain (go-keyring shells out to
+#   /usr/bin/security). The secret is the same nested token JSON as the file,
+#   wrapped in a "go-keyring-base64:<base64>" envelope.
+# - Windows: Credential Manager, generic credential "gemini:antigravity". The
+#   blob is the raw token JSON (no envelope) and carries id_token_email in
+#   place of id_token — wincred caps a blob at 2560 bytes.
+# AGY_SWITCH_KEYRING_SERVICE points the tool at a different item (for tests).
+KEYCHAIN_SERVICE = os.environ.get("AGY_SWITCH_KEYRING_SERVICE", "gemini")
 KEYCHAIN_ACCOUNT = "antigravity"
 KEYCHAIN_LOC = f"keychain://{KEYCHAIN_SERVICE}/{KEYCHAIN_ACCOUNT}"
 _GO_KEYRING_B64 = "go-keyring-base64:"
@@ -104,8 +139,16 @@ _OAUTH_CACHE = os.path.join(STORE, "oauth-client.json")
 def real_agy_binary():
     """Path of the real agy binary, looking through our own shim if installed."""
     agy = shutil.which("agy")
-    for path in (agy, agy + ".real" if agy else None,
-                 os.path.expanduser("~/.local/bin/agy.real")):
+    cands = [agy, agy + ".real" if agy else None,
+             os.path.expanduser("~/.local/bin/agy.real")]
+    if IS_WIN:
+        # the Windows shim (agy.exe, or agy.cmd) sits beside agy.real.exe (see install_shim_win)
+        local = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~/AppData/Local")
+        cands += [os.path.splitext(agy)[0] + ".real.exe" if agy else None,
+                  (load_json(PROXY_FILE) or {}).get("real_path"),
+                  os.path.join(local, "agy", "bin", "agy.exe"),
+                  os.path.join(local, "agy", "bin", "agy.real.exe")]
+    for path in cands:
         if path and os.path.isfile(path) and not is_shim(path):
             return path
     return None
@@ -114,7 +157,10 @@ def real_agy_binary():
 def _scan_oauth_strings(path):
     """All client-id / client-secret strings found in the agy binary."""
     pats = {"id": re.compile(rb"\d{6,}-[a-z0-9]+\.apps\.googleusercontent\.com"),
-            "secret": re.compile(rb"GOCSPX-(?:(?!GOCSPX-)[A-Za-z0-9_\-])+")}
+            # Google client secrets are always GOCSPX- plus 28 characters. Fix the
+            # length: binaries pack strings back to back, and an open-ended match
+            # runs into whatever follows (seen on Windows builds of agy)
+            "secret": re.compile(rb"GOCSPX-[A-Za-z0-9_\-]{28}")}
     got = {"id": [], "secret": []}
     tail, eof = b"", False
     with open(path, "rb") as f:
@@ -235,7 +281,21 @@ def write_json_atomic(path, obj):
     with open(tmp, "w") as f:
         json.dump(obj, f)
     os.chmod(tmp, 0o600)
-    os.replace(tmp, path)
+    replace_file(tmp, path)
+
+
+def replace_file(src, dst):
+    """os.replace, retried briefly on Windows: there a rename onto a file that
+    another process (agy, a second agy-switch, an antivirus scan) has open for
+    reading fails with a sharing violation instead of just succeeding."""
+    tries = 20 if IS_WIN else 1
+    for attempt in range(tries):
+        try:
+            return os.replace(src, dst)
+        except PermissionError:
+            if attempt == tries - 1:
+                raise
+            time.sleep(0.05)
 
 
 # ------------------------------------------------------- macOS keychain store
@@ -251,13 +311,126 @@ KC_DEGRADED = ""  # last keychain error, reported once by kc_warn()
 
 
 def use_keychain():
-    """True when agy here stores its token in the macOS login keychain: darwin,
-    a local GUI session (not SSH), and the `security` CLI present."""
+    """True when agy here stores its token in the OS credential store: the
+    macOS login keychain (darwin, a local GUI session, `security` present) or
+    the Windows Credential Manager (any local session)."""
     global _USE_KC
     if _USE_KC is None:
-        _USE_KC = (sys.platform == "darwin" and not ssh_detected()
-                   and shutil.which("security") is not None)
+        if IS_WIN:
+            _USE_KC = not ssh_detected() and _wincred() is not None
+        else:
+            _USE_KC = (sys.platform == "darwin" and not ssh_detected()
+                       and shutil.which("security") is not None)
     return _USE_KC
+
+
+def kc_store_name():
+    return "Windows Credential Manager" if IS_WIN else "macOS keychain"
+
+
+# ---------------------------------------------- Windows Credential Manager
+
+_WINCRED = None
+CRED_TYPE_GENERIC = 1
+CRED_PERSIST_LOCAL_MACHINE = 2
+ERROR_NOT_FOUND = 1168
+WINCRED_MAX_BLOB = 2560  # CRED_MAX_CREDENTIAL_BLOB_SIZE (5 * 512)
+
+
+def _wincred():
+    """(advapi32, CREDENTIALW) via ctypes, or None when unavailable."""
+    global _WINCRED
+    if _WINCRED is None:
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class CREDENTIALW(ctypes.Structure):
+                _fields_ = [("Flags", wintypes.DWORD), ("Type", wintypes.DWORD),
+                            ("TargetName", wintypes.LPWSTR), ("Comment", wintypes.LPWSTR),
+                            ("LastWritten", wintypes.FILETIME),
+                            ("CredentialBlobSize", wintypes.DWORD),
+                            ("CredentialBlob", ctypes.POINTER(ctypes.c_ubyte)),
+                            ("Persist", wintypes.DWORD), ("AttributeCount", wintypes.DWORD),
+                            ("Attributes", ctypes.c_void_p), ("TargetAlias", wintypes.LPWSTR),
+                            ("UserName", wintypes.LPWSTR)]
+
+            adv = ctypes.WinDLL("advapi32", use_last_error=True)
+            adv.CredReadW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                      ctypes.POINTER(ctypes.POINTER(CREDENTIALW))]
+            adv.CredReadW.restype = wintypes.BOOL
+            adv.CredWriteW.argtypes = [ctypes.POINTER(CREDENTIALW), wintypes.DWORD]
+            adv.CredWriteW.restype = wintypes.BOOL
+            adv.CredDeleteW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD]
+            adv.CredDeleteW.restype = wintypes.BOOL
+            adv.CredFree.argtypes = [ctypes.c_void_p]
+            adv.CredFree.restype = None
+            _WINCRED = (adv, CREDENTIALW)
+        except Exception:
+            _WINCRED = False
+    return _WINCRED or None
+
+
+def _wincred_target():
+    # go-keyring's Windows backend names the credential "<service>:<user>"
+    return f"{KEYCHAIN_SERVICE}:{KEYCHAIN_ACCOUNT}"
+
+
+def _wincred_read():
+    """(rc, secret, err) — same contract as _kc_run's find-generic-password."""
+    import ctypes
+    adv, CREDENTIALW = _wincred()
+    p = ctypes.POINTER(CREDENTIALW)()
+    if not adv.CredReadW(_wincred_target(), CRED_TYPE_GENERIC, 0, ctypes.byref(p)):
+        e = ctypes.get_last_error()
+        return 1, "", ("could not be found" if e == ERROR_NOT_FOUND
+                       else f"CredReadW failed (error {e})")
+    try:
+        c = p.contents
+        raw = bytes(c.CredentialBlob[:c.CredentialBlobSize])
+    finally:
+        adv.CredFree(p)
+    return 0, raw.decode("utf-8", "replace"), ""
+
+
+def _wincred_write(secret):
+    import ctypes
+    adv, CREDENTIALW = _wincred()
+    data = secret.encode("utf-8")
+    if len(data) > WINCRED_MAX_BLOB:
+        return 1, f"token is {len(data)} bytes, over the {WINCRED_MAX_BLOB}-byte limit"
+    buf = (ctypes.c_ubyte * len(data)).from_buffer_copy(data)
+    cred = CREDENTIALW()
+    cred.Type = CRED_TYPE_GENERIC
+    cred.TargetName = _wincred_target()
+    cred.CredentialBlobSize = len(data)
+    cred.CredentialBlob = ctypes.cast(buf, ctypes.POINTER(ctypes.c_ubyte))
+    cred.Persist = CRED_PERSIST_LOCAL_MACHINE
+    cred.UserName = KEYCHAIN_ACCOUNT
+    if not adv.CredWriteW(ctypes.byref(cred), 0):
+        return 1, f"CredWriteW failed (error {ctypes.get_last_error()})"
+    return 0, ""
+
+
+def _wincred_delete():
+    import ctypes
+    adv, _C = _wincred()
+    if adv.CredDeleteW(_wincred_target(), CRED_TYPE_GENERIC, 0):
+        return 0, ""
+    e = ctypes.get_last_error()
+    return 1, ("could not be found" if e == ERROR_NOT_FOUND
+               else f"CredDeleteW failed (error {e})")
+
+
+def _wincred_blob(base):
+    """The JSON agy itself writes on Windows: id_token_email instead of the
+    (large) id_token, so the blob stays under wincred's 2560-byte cap."""
+    blob = dict(base)
+    email = decode_email(blob)
+    if email != "?":
+        blob["id_token_email"] = email
+    blob.pop("id_token", None)
+    return json.dumps(blob)
 
 
 def _kc_run(args, stdin=None):
@@ -274,8 +447,11 @@ def _kc_run(args, stdin=None):
 def kc_read_raw():
     """Secret string of agy's keychain item, or None when absent/unreadable."""
     global KC_DEGRADED
-    rc, out, err = _kc_run(["find-generic-password", "-s", KEYCHAIN_SERVICE,
-                            "-a", KEYCHAIN_ACCOUNT, "-w"])
+    if IS_WIN:
+        rc, out, err = _wincred_read()
+    else:
+        rc, out, err = _kc_run(["find-generic-password", "-s", KEYCHAIN_SERVICE,
+                                "-a", KEYCHAIN_ACCOUNT, "-w"])
     if rc != 0:
         if "could not be found" not in err:
             KC_DEGRADED = err.strip() or f"security exited {rc}"
@@ -315,11 +491,16 @@ def kc_write(nested):
     a command line. Returns True only when the write reads back correctly."""
     global KC_DEGRADED
     base = kc_decode(kc_read_raw()) or {}
+    # identity fields belong to the previous account — never carry them over
+    for k in ("id_token", "id_token_email"):
+        base.pop(k, None)
     base.update(nested)
-    import base64
-    blob = _GO_KEYRING_B64 + base64.b64encode(json.dumps(base).encode()).decode()
-    rc, _o, err = _kc_run(["-i"], stdin="add-generic-password -U -s %s -a %s -w %s\n"
-                          % (KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, blob))
+    if IS_WIN:
+        rc, err = _wincred_write(_wincred_blob(base))
+    else:
+        blob = _GO_KEYRING_B64 + base64.b64encode(json.dumps(base).encode()).decode()
+        rc, _o, err = _kc_run(["-i"], stdin="add-generic-password -U -s %s -a %s -w %s\n"
+                              % (KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, blob))
     if rc != 0:
         KC_DEGRADED = err.strip() or f"security exited {rc}"
         return False
@@ -335,8 +516,11 @@ def kc_write(nested):
 def kc_delete():
     """Remove agy's keychain item; True when gone (or never there)."""
     global KC_DEGRADED
-    rc, _o, err = _kc_run(["delete-generic-password",
-                           "-s", KEYCHAIN_SERVICE, "-a", KEYCHAIN_ACCOUNT])
+    if IS_WIN:
+        rc, err = _wincred_delete()
+    else:
+        rc, _o, err = _kc_run(["delete-generic-password",
+                               "-s", KEYCHAIN_SERVICE, "-a", KEYCHAIN_ACCOUNT])
     if rc != 0 and "could not be found" not in err:
         KC_DEGRADED = err.strip() or f"security exited {rc}"
         return False
@@ -345,18 +529,18 @@ def kc_delete():
 
 def kc_warn():
     if KC_DEGRADED:
-        print(f"agy-switch: macOS keychain unavailable ({KC_DEGRADED}) — "
+        print(f"agy-switch: {kc_store_name()} unavailable ({KC_DEGRADED}) — "
               f"using agy's token file instead", file=sys.stderr)
 
 
 def decode_email(tok):
     try:
-        import base64
         part = tok.get("id_token", "").split(".")[1]
         part += "=" * (-len(part) % 4)
         return json.loads(base64.urlsafe_b64decode(part)).get("email", "?")
     except Exception:
-        return "?"
+        # agy on Windows stores the bare email instead of the id_token
+        return (tok.get("id_token_email") if isinstance(tok, dict) else None) or "?"
 
 
 def valid_token_file(tok):
@@ -630,6 +814,10 @@ def live_cred():
     return LIVE, None, "nested"
 
 
+class CredentialStoreError(Exception):
+    """The OS credential store refused a write that agy-switch can't route around."""
+
+
 def write_live(nested, loc, style):
     """Write the live credential where agy reads it. On macOS that is the
     keychain; an existing token file is kept in sync as a mirror (an agy started
@@ -640,6 +828,12 @@ def write_live(nested, loc, style):
             if os.path.isfile(LIVE):
                 write_json_atomic(LIVE, nested)
             return
+        if IS_WIN:
+            # agy on Windows reads the Credential Manager first, so the token
+            # file would be ignored and agy would stay on the previous account
+            raise CredentialStoreError(
+                f"could not write the login to the Windows Credential Manager ({KC_DEGRADED}) — "
+                "nothing was switched")
         kc_warn()
         write_json_atomic(LIVE, nested)
         return
@@ -714,15 +908,34 @@ def mark_active(name):
     update_meta(_mark)
 
 
+WIN_AGY_IMAGES = ("agy.exe", "agy.real.exe")
+
+
+def count_agy_procs():
+    """Number of running agy processes, or None when that can't be determined."""
+    try:
+        if IS_WIN:
+            # with the shim installed, agy.exe is only its launcher — every
+            # session also runs agy.real.exe, so count that alone
+            agy = shutil.which("agy")
+            images = ("agy.real.exe",) if agy and is_shim(agy) else WIN_AGY_IMAGES
+            out = subprocess.run(["tasklist", "/FO", "CSV", "/NH"], capture_output=True,
+                                 text=True, errors="replace", timeout=15).stdout
+            return sum(1 for ln in out.splitlines()
+                       if ln.split('","', 1)[0].strip('"').lower() in images)
+        r = subprocess.run(["pgrep", "-f", r"(^|/)agy( |$)|agy[.]real"],
+                           capture_output=True, text=True)
+        if r.returncode > 1:  # 1 = no match; >1 = pgrep error
+            return None
+        return sum(1 for ln in r.stdout.splitlines() if ln.strip())
+    except Exception:
+        return None
+
+
 def running_agy_procs():
     """How many agy processes are alive. They hold the old login in memory and
     rewrite the shared token file when their access token refreshes."""
-    try:
-        out = subprocess.run(["pgrep", "-f", r"(^|/)agy( |$)|agy[.]real"],
-                             capture_output=True, text=True).stdout
-        return sum(1 for ln in out.splitlines() if ln.strip())
-    except Exception:
-        return 0
+    return count_agy_procs() or 0
 
 
 def warn_running_agy():
@@ -949,9 +1162,12 @@ def cmd_login():
     # every agy start — exactly what this login just stashed away. Stand down.
     os.environ["AGY_SWITCH_NO_REASSERT"] = "1"
     try:
-        subprocess.call([AGY_BIN])
+        # which() honors PATHEXT on Windows, so an agy.cmd shim is found too
+        subprocess.call([shutil.which(AGY_BIN) or AGY_BIN])
     except KeyboardInterrupt:
         pass
+    except OSError as e:
+        print(f"agy-switch: could not start agy ({e})", file=sys.stderr)
     finally:
         stop.set()
         os.environ.pop("AGY_SWITCH_NO_REASSERT", None)
@@ -1148,6 +1364,68 @@ def restore_termios(fd, old):
         pass
 
 
+class PosixTerm:
+    """Raw-mode keyboard input on a POSIX tty (termios + select)."""
+
+    def __init__(self):
+        import termios
+        self.fd = sys.stdin.fileno()
+        self.old = termios.tcgetattr(self.fd)
+
+    def raw(self):
+        import tty
+        tty.setraw(self.fd)
+
+    def cooked(self):
+        restore_termios(self.fd, self.old)
+
+    def wait(self, timeout):
+        """True when a key is ready within `timeout` seconds."""
+        r, _, _ = select.select([sys.stdin], [], [], timeout)
+        return bool(r)
+
+    def key(self):
+        return read_term_key(self.fd)
+
+
+class WinTerm:
+    """Keyboard input on a Windows console (msvcrt). The console needs no raw
+    mode: getwch() already reads single keys without echo. Arrow keys arrive
+    as a 0x00/0xE0 prefix followed by a scan code."""
+
+    SCAN_KEYS = {"H": "up", "P": "down"}
+
+    def raw(self):
+        pass
+
+    def cooked(self):
+        pass
+
+    def wait(self, timeout):
+        import msvcrt
+        end = time.time() + timeout
+        while not msvcrt.kbhit():
+            if time.time() >= end:
+                return False
+            time.sleep(0.03)
+        return True
+
+    def key(self):
+        import msvcrt
+        ch = msvcrt.getwch()
+        if ch in ("\x00", "\xe0"):
+            return self.SCAN_KEYS.get(msvcrt.getwch(), "")
+        if ch in ("\r", "\n"):
+            return "enter"
+        if ch == ESC:
+            return "esc"
+        return ch
+
+
+def open_term():
+    return WinTerm() if IS_WIN else PosixTerm()
+
+
 def tui(action="switch"):
     """Interactive account picker ('switch' or 'logout'). Returns the chosen
     profile name, or None if the user bailed."""
@@ -1223,20 +1501,16 @@ def tui(action="switch"):
         sys.stdout.write("".join(out))
         sys.stdout.flush()
 
-    import termios
-    import tty
-    fd = sys.stdin.fileno()
-    old = termios.tcgetattr(fd)
+    term = open_term()
     try:
-        tty.setraw(fd)
+        term.raw()
         sys.stdout.write(f"{ESC}[?1049h{ESC}[?25l")  # alt screen, hide cursor
         render()
         while True:
-            r, _, _ = select.select([sys.stdin], [], [], 0.5)
-            if not r:
+            if not term.wait(0.5):
                 render()  # pick up background quota refreshes
                 continue
-            k = read_term_key(fd)
+            k = term.key()
             if k == "up":
                 state["sel"] = (state["sel"] - 1) % len(names)
             elif k == "down":
@@ -1256,7 +1530,7 @@ def tui(action="switch"):
                 break
             render()
     finally:
-        restore_termios(fd, old)
+        term.cooked()
         try:
             sys.stdout.write(f"{ESC}[?25h{ESC}[?1049l")  # show cursor, leave alt screen
             sys.stdout.flush()
@@ -1473,6 +1747,8 @@ PROXY_VARS = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_pro
 
 
 def write_proxy_env(db=None):
+    if IS_WIN:
+        return  # proxy.env is for the bash shim; win_shim_exec reads proxy.json
     db = db if db is not None else load_proxy_db()
     name, cfg, _ = active_proxy(db)
     enabled = cfg is not None  # expiry is decided by the shim at agy start
@@ -1530,18 +1806,248 @@ def write_proxy_env(db=None):
 
 
 def is_shim(path):
+    # shims are small (the bash script, or launcher + zip on Windows); agy is not
     try:
         if os.path.getsize(path) > 1024 * 1024:
             return False
         with open(path, "rb") as f:
-            return SHIM_MARKER.encode() in f.read(512)
+            return SHIM_MARKER.encode() in f.read()
     except OSError:
         return False
+
+
+# Windows shim, preferred form: a real agy.exe built like pip's console-script
+# wrappers (distlib's launcher + a "#!python" line + a zip with __main__.py).
+# Unlike a .cmd it can be started by anything that runs `agy` without a shell
+# (Node's spawn, Python's subprocess, editors), keeps multi-line arguments, and
+# never leaves cmd's "Terminate batch job (Y/N)?" prompt after Ctrl-C.
+WIN_SHIM_MAIN = """# @MARKER@ - managed by `agy-switch proxy`
+import runpy, sys
+sys.argv = [@SCRIPT@, "__shim", @REAL@] + sys.argv[1:]
+runpy.run_path(@SCRIPT@, run_name="__main__")
+"""
+
+# Fallback when pip's launcher isn't available: agy.cmd beside agy.real.exe.
+WIN_SHIM_TEMPLATE = """@echo off
+rem @MARKER@ - managed by `agy-switch proxy`; the real binary is @REAL@
+@PY@ "@SCRIPT@" __shim "@REAL@" %*
+exit /b %ERRORLEVEL%
+"""
+
+
+def _win_launcher():
+    """Bytes of pip's console-script launcher for this Python, or None."""
+    import importlib.util
+    import sysconfig
+    try:
+        spec = importlib.util.find_spec("pip")
+    except (ImportError, ValueError):
+        return None
+    if not spec or not spec.submodule_search_locations:
+        return None
+    arch = sysconfig.get_platform().rsplit("-", 1)[-1]  # win-amd64 / win-arm64 / win32
+    name = {"amd64": "t64.exe", "arm64": "t64-arm.exe"}.get(arch, "t32.exe")
+    path = os.path.join(list(spec.submodule_search_locations)[0], "_vendor", "distlib", name)
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def win_python_command():
+    """How shims start Python. The `py` launcher survives Python upgrades; a
+    Microsoft Store Python's own path is versioned, so its stable app alias is
+    used instead; otherwise the running interpreter."""
+    py = shutil.which("py")
+    if py and py.lower().endswith(".exe"):
+        return [py, "-3"]
+    exe = sys.executable
+    if "\\windowsapps\\" in exe.lower():
+        alias = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "WindowsApps",
+                             "python3.exe")
+        if os.path.isfile(alias):
+            return [alias]
+    return [exe]
+
+
+def win_short_path(path):
+    """`path`, or its 8.3 short form when it has non-ASCII characters: .cmd files
+    are read in the console code page, which can't hold them (e.g. C:\\Users\\José)."""
+    if path.isascii():
+        return path
+    import ctypes
+    buf = ctypes.create_unicode_buffer(32768)
+    n = ctypes.windll.kernel32.GetShortPathNameW(path, buf, len(buf))
+    return buf.value if 0 < n < len(buf) and buf.value.isascii() else path
+
+
+def _cmd_quote(path):
+    """A path for use inside a double-quoted .cmd argument."""
+    return win_short_path(path).replace("%", "%%")
+
+
+def _shim_exe_bytes(launcher, real):
+    import io
+    import zipfile
+    cmd = win_python_command()
+    exe = win_short_path(cmd[0])  # keep the launcher's "#!" line plain ASCII
+    shebang = "#!" + (f'"{exe}"' if " " in exe else exe) + "".join(f" {a}" for a in cmd[1:])
+    main = (WIN_SHIM_MAIN.replace("@MARKER@", SHIM_MARKER)
+            .replace("@SCRIPT@", repr(SCRIPT_PATH)).replace("@REAL@", repr(real)))
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as z:
+        z.writestr("__main__.py", main)
+    return launcher + shebang.encode("utf-8") + b"\r\n" + buf.getvalue()
+
+
+def _write_if_changed(path, data):
+    """Write `path` atomically unless it already holds `data`. A running .exe
+    can't be overwritten but can be renamed, so a busy shim is moved aside."""
+    try:
+        with open(path, "rb") as f:
+            if f.read() == data:
+                return
+    except OSError:
+        pass
+    tmp = f"{path}.tmp.{os.getpid()}"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    try:
+        replace_file(tmp, path)
+    except OSError:
+        os.replace(path, f"{path}.old.{os.getpid()}")
+        os.replace(tmp, path)
+    folder, name = os.path.split(path)
+    for leftover in os.listdir(folder or "."):
+        if leftover.startswith(f"{name}.old."):
+            try:
+                os.remove(os.path.join(folder, leftover))
+            except OSError:
+                pass  # still running; removed on a later run
+
+
+def install_shim_win(cfg):
+    """Windows: move agy.exe to agy.real.exe and put a shim in its place — an
+    agy.exe launcher (see WIN_SHIM_MAIN), or agy.cmd when pip's launcher is
+    missing. Both run win_shim_exec. An `agy update` that writes a new agy.exe
+    over the shim is moved behind it again on the next agy-switch run.
+    Returns cfg or None."""
+    real, orig = cfg.get("real_path"), cfg.get("orig_path")
+    if not (real and orig):
+        found = shutil.which("agy")
+        if not found:
+            return None
+        base = os.path.splitext(found)[0]
+        orig, real = f"{base}.exe", f"{base}.real.exe"
+    if os.path.isfile(orig) and not is_shim(orig):
+        try:
+            replace_file(orig, real)
+        except OSError:
+            # the old agy.real.exe is running and can't be replaced; leave the
+            # new agy.exe in charge until the next agy-switch run
+            return cfg if os.path.isfile(real) and cfg.get("shim_path") else None
+    elif not os.path.isfile(real):
+        return None
+    base = os.path.splitext(orig)[0]
+    legacy_cmd = f"{base}.cmd"
+    launcher = _win_launcher()
+    if launcher:
+        _write_if_changed(orig, _shim_exe_bytes(launcher, real))
+        shim = orig
+        if is_shim(legacy_cmd):  # an older agy-switch installed the .cmd form
+            try:
+                os.remove(legacy_cmd)
+            except OSError:
+                pass
+    else:
+        if os.path.isfile(orig) and is_shim(orig):
+            os.remove(orig)  # the .cmd only wins PATH lookup once agy.exe is gone
+        py = " ".join(f'"{_cmd_quote(p)}"' if i == 0 else p
+                      for i, p in enumerate(win_python_command()))
+        body = (WIN_SHIM_TEMPLATE.replace("@MARKER@", SHIM_MARKER)
+                .replace("@PY@", py)
+                .replace("@SCRIPT@", _cmd_quote(SCRIPT_PATH))
+                .replace("@REAL@", _cmd_quote(real)))
+        _write_if_changed(legacy_cmd, body.replace("\n", "\r\n").encode("ascii", "replace"))
+        shim = legacy_cmd
+    cfg["shim_path"], cfg["real_path"], cfg["orig_path"] = shim, real, orig
+    return cfg
+
+
+def win_shim_exec(real, args):
+    """What the Windows shim runs — the Python twin of SHIM_TEMPLATE: apply
+    the active proxy (env the user set wins), honor its expiry, warn about a
+    blocked network or unsupported region, re-assert the account picked via
+    agy-switch, then run the real agy and pass its exit code through."""
+    env = dict(os.environ)
+    try:
+        _name, cfg, state = active_proxy()
+    except Exception:
+        cfg, state = None, "off"
+    use = cfg is not None
+    if use and state == "expired_fallback":
+        print("agy-switch: proxy expired — falling back to a DIRECT connection", file=sys.stderr)
+        use = False
+    elif use and state == "expired_block":
+        print("agy-switch: proxy expired and fallback is off — refusing to run agy\n"
+              "  update it with 'agy-switch proxy' or disable with 'agy-switch proxy off'",
+              file=sys.stderr)
+        return 1
+    if use:
+        # Windows env names are case-insensitive: the upper-case set covers all six
+        unset = [v for v in PROXY_VARS if v.isupper() and v not in os.environ]
+        url = proxy_url(cfg)
+        if is_socks(cfg) and unset:
+            bridge = bridge_ensure()
+            if bridge:
+                url = bridge
+            else:
+                print(f"agy-switch: local proxy bridge failed to start (see {BRIDGE_LOG}) —\n"
+                      "  exporting the SOCKS URL directly; tools without socks5h support"
+                      " (gh, npm, ...) may fail", file=sys.stderr)
+        for var in unset:
+            env[var] = url
+        env["NO_PROXY"] = "localhost,127.0.0.1,::1"
+    try:
+        if netcheck_cached(net_tag()) is None:
+            warn_net(*net_ok())
+    except Exception:
+        pass
+    if not os.environ.get("AGY_SWITCH_NO_REASSERT"):
+        try:
+            reassert_current()
+        except CredentialStoreError as e:
+            print(f"agy-switch: {e}", file=sys.stderr)
+        except Exception:
+            pass
+    # agy shares this console and handles Ctrl-C itself; don't die before it does
+    signal.signal(signal.SIGINT, lambda *_a: None)
+    try:
+        return subprocess.call([real] + list(args), env=env)
+    except OSError as e:
+        print(f"agy-switch: cannot run {real} ({e})", file=sys.stderr)
+        return 1
+
+
+def reassert_current():
+    """Write the recorded account back into the live store when a still-running
+    agy of another account overwrote it (see SHIM_TEMPLATE)."""
+    cur = get_current()
+    prof = load_json(profile_path(cur)) if cur else None
+    if not valid_token_file(prof):
+        return
+    loc, live, style = live_cred()
+    if live and refresh_token_of(live) == refresh_token_of(prof):
+        return
+    write_live(prof, loc, style)
 
 
 def install_shim(cfg):
     """Put the proxy shim where `agy` lives, moving the real binary to agy.real.
     Also repairs the shim after `agy update` replaces it. Returns cfg or None."""
+    if IS_WIN:
+        return install_shim_win(cfg)
     shim = cfg.get("shim_path")
     real = cfg.get("real_path")
     if not shim:
@@ -1726,12 +2232,8 @@ def _split_hostport(target):
 
 def _agy_alive():
     """Is any agy running? Errs on the side of yes (keeps the bridge up)."""
-    try:
-        r = subprocess.run(["pgrep", "-f", r"(^|/)agy( |$)|agy[.]real"],
-                           capture_output=True, text=True)
-    except Exception:
-        return True
-    return r.returncode != 1  # 1 = no match; 0 = match; >1 = pgrep error
+    n = count_agy_procs()
+    return n is None or n > 0
 
 
 class _Bridge:
@@ -1910,7 +2412,12 @@ class _Bridge:
 def _listen(port):
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if IS_WIN:
+            # Windows SO_REUSEADDR would let a second bridge bind the same busy
+            # port; exclusive use makes the bind fail like it does on POSIX
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        else:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind(("127.0.0.1", port))
         s.listen(128)
         return s
@@ -1950,21 +2457,74 @@ def bridge_run():
 
 def _pid_is_bridge(pid):
     try:
-        cmd = subprocess.run(["ps", "-o", "command=", "-p", str(int(pid))],
-                             capture_output=True, text=True).stdout
+        if IS_WIN:
+            q = f"(Get-CimInstance Win32_Process -Filter 'ProcessId={int(pid)}').CommandLine"
+            cmd = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", q],
+                                 capture_output=True, text=True, timeout=20).stdout
+        else:
+            cmd = subprocess.run(["ps", "-o", "command=", "-p", str(int(pid))],
+                                 capture_output=True, text=True).stdout
     except Exception:
         return False
     return "agy-switch" in cmd and "bridge run" in cmd
 
 
+class FileLock:
+    """Exclusive lock on a file for the duration of a `with` block (flock on
+    POSIX, a one-byte msvcrt lock on Windows)."""
+
+    def __init__(self, path):
+        self.path = path
+
+    def __enter__(self):
+        self.f = open(self.path, "a+")
+        if IS_WIN:
+            import msvcrt
+            self.f.seek(0)
+            while True:
+                try:
+                    msvcrt.locking(self.f.fileno(), msvcrt.LK_LOCK, 1)
+                    break
+                except OSError:  # LK_LOCK gives up after ~10s; keep waiting
+                    pass
+        else:
+            import fcntl
+            fcntl.flock(self.f, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        if IS_WIN:
+            import msvcrt
+            try:
+                self.f.seek(0)
+                msvcrt.locking(self.f.fileno(), msvcrt.LK_UNLCK, 1)
+            except OSError:
+                pass
+        self.f.close()
+
+
+def _detached_popen(argv, log, env):
+    """Start a background process that outlives this one and its terminal."""
+    kw = dict(stdin=subprocess.DEVNULL, stdout=log, stderr=log, env=env, close_fds=True)
+    if not IS_WIN:
+        return subprocess.Popen(argv, cwd="/", start_new_session=True, **kw)
+    DETACHED_PROCESS, CREATE_NEW_PROCESS_GROUP = 0x00000008, 0x00000200
+    CREATE_BREAKAWAY_FROM_JOB = 0x01000000
+    flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+    try:
+        # leave the terminal's job object (if any) so closing it doesn't kill us
+        return subprocess.Popen(argv, cwd=STORE,
+                                creationflags=flags | CREATE_BREAKAWAY_FROM_JOB, **kw)
+    except OSError:
+        return subprocess.Popen(argv, cwd=STORE, creationflags=flags, **kw)
+
+
 def bridge_ensure(timeout=5):
     """Start the bridge unless it already answers; return its URL or None."""
-    import fcntl
     if not is_socks(active_proxy()[1]):
         return None
     os.makedirs(STORE, exist_ok=True)
-    with open(BRIDGE_LOCK, "a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)  # concurrent agy starts spawn one bridge
+    with FileLock(BRIDGE_LOCK):  # concurrent agy starts spawn one bridge
         st = bridge_state()
         if bridge_ping(st):
             return bridge_url(st)
@@ -1981,9 +2541,7 @@ def bridge_ensure(timeout=5):
         except OSError:
             big = False
         with open(BRIDGE_LOG, "w" if big else "a") as log:
-            p = subprocess.Popen([sys.executable, SCRIPT_PATH, "bridge", "run"],
-                                 stdin=subprocess.DEVNULL, stdout=log, stderr=log,
-                                 cwd="/", env=env, close_fds=True, start_new_session=True)
+            p = _detached_popen([sys.executable, SCRIPT_PATH, "bridge", "run"], log, env)
         deadline = time.time() + timeout
         while time.time() < deadline:
             st = bridge_state()
@@ -2045,6 +2603,29 @@ def net_tag():
     return "D"
 
 
+def netcheck_cached(tag):
+    """net_ok()'s cached (state, cc) for path `tag`, or None when stale/absent."""
+    try:
+        with open(NETCHECK) as f:
+            last, state, cc, ctag = (f.read().split() + ["", "", "", ""])[:4]
+        ttl = 21600 if state == "1" else 600
+        if ctag == tag and time.time() - float(last) < ttl:
+            return {"0": "blocked", "1": "ok"}.get(state, "region"), cc
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def warn_net(state, cc):
+    if state == "blocked":
+        print("agy-switch: cannot reach Google's API from this network — agy may fail\n"
+              "  or report 'region not supported'. Fix: agy-switch proxy", file=sys.stderr)
+    elif state == "region":
+        print(f"agy-switch: your current IP region ({cc or '?'}) is not supported by Google AI —\n"
+              "  agy will report 'region not supported'. Fix: agy-switch proxy\n"
+              "  (route through a supported region such as JP/SG/US)", file=sys.stderr)
+
+
 def net_ok():
     """Network quality for agy: (state, country_code).
     state is 'ok' | 'blocked' (API unreachable) | 'region' (IP in unsupported region).
@@ -2053,13 +2634,9 @@ def net_ok():
     toggling the proxy forces a fresh probe. When a proxy is enabled, the probe
     goes through it (the path agy will actually use)."""
     tag = net_tag()
-    try:
-        last, state, cc, ctag = (open(NETCHECK).read().split() + ["", "", "", ""])[:4]
-        ttl = 21600 if state == "1" else 600
-        if ctag == tag and time.time() - float(last) < ttl:
-            return {"0": "blocked", "1": "ok"}.get(state, "region"), cc
-    except (OSError, ValueError):
-        pass
+    cached = netcheck_cached(tag)
+    if cached:
+        return cached
     # probe through the same path agy will take: the configured proxy when
     # enabled, else the user's own env proxy (via curl — urllib can't do
     # https:// or socks proxies), else direct.
@@ -2136,7 +2713,7 @@ def http_test(url, timeout=8):
     curl exits 0 once the tunnel+TLS+HTTP round trip completes."""
     if shutil.which("curl"):
         return subprocess.call(
-            ["curl", "-s", "--max-time", str(timeout), "-o", "/dev/null",
+            ["curl", "-s", "--max-time", str(timeout), "-o", os.devnull,
              "-x", url, AGY_ENDPOINT],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0
     try:
@@ -2195,7 +2772,7 @@ def probe_proxy(cfg, timeout=6):
         out["err"] = "curl not found"
         return out
     px = proxy_url(cfg)
-    if subprocess.call(["curl", "-s", "--max-time", str(timeout), "-o", "/dev/null",
+    if subprocess.call(["curl", "-s", "--max-time", str(timeout), "-o", os.devnull,
                         "-x", px, AGY_ENDPOINT],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) != 0:
         out["err"] = "cannot tunnel to googleapis — dead proxy, wrong protocol, or blocked by the local network"
@@ -2515,17 +3092,14 @@ def proxy_manager():
         for n in todo:
             threading.Thread(target=probe_worker, args=(n,), daemon=True).start()
 
-    import termios
-    import tty
-    fd = sys.stdin.fileno()
-    old = termios.tcgetattr(fd)
+    term = open_term()
 
     def read_key():
-        return read_term_key(fd)
+        return term.key()
 
     def line_input(prompt, secret=False):
         """One cooked-mode input line inside the alt screen (for field edits)."""
-        restore_termios(fd, old)
+        term.cooked()
         sys.stdout.write(f"{ESC}[?25h\r\n {CYAN}{prompt}{RESET} ")
         sys.stdout.flush()
         try:
@@ -2533,7 +3107,7 @@ def proxy_manager():
         except (KeyboardInterrupt, EOFError):
             return None
         finally:
-            tty.setraw(fd)
+            term.raw()
             sys.stdout.write(f"{ESC}[?25l")
 
     def check_line(n):
@@ -2694,12 +3268,11 @@ def proxy_manager():
 
     kick_probes()
     try:
-        tty.setraw(fd)
+        term.raw()
         sys.stdout.write(f"{ESC}[?1049h{ESC}[?25l")
         render()
         while True:
-            r, _, _ = select.select([sys.stdin], [], [], 0.5)
-            if not r:
+            if not term.wait(0.5):
                 render()
                 continue
             k = read_key()
@@ -2742,11 +3315,11 @@ def proxy_manager():
                 break
             elif k == "a":
                 sys.stdout.write(f"{ESC}[?1049l{ESC}[?25h")
-                restore_termios(fd, old)
+                term.cooked()
                 proxy_wizard(db)          # saves + enables on its own
                 db = load_proxy_db()
                 kick_probes(force=True)
-                tty.setraw(fd)
+                term.raw()
                 sys.stdout.write(f"{ESC}[?1049h{ESC}[?25l")
             elif k == "e" and ns:
                 n = ns[state["sel"]]
@@ -2791,7 +3364,7 @@ def proxy_manager():
             render()
     finally:
         save_proxy_db(db)  # persist probe cache
-        restore_termios(fd, old)
+        term.cooked()
         try:
             sys.stdout.write(f"{ESC}[?25h{ESC}[?1049l")
             sys.stdout.flush()
@@ -2807,7 +3380,8 @@ USAGE = """agy-switch — multi-account manager for Antigravity CLI (agy).
 
 agy keeps one OAuth token at ~/.gemini/antigravity-cli/antigravity-oauth-token
 (on macOS with a GUI: in the login keychain, service "gemini" / account
-"antigravity"). A "profile" is a snapshot of that credential.
+"antigravity"; on Windows: in the Credential Manager as "gemini:antigravity").
+A "profile" is a snapshot of that credential.
 Switching = writing a snapshot back.
 
 Usage:
@@ -2836,6 +3410,9 @@ def main():
     if sys.argv[1:2] == ["bridge"]:
         # fast path: proxy.env runs `bridge ensure` on every agy start
         return cmd_bridge(sys.argv[2:])
+    if sys.argv[1:2] == ["__shim"] and len(sys.argv) > 2:
+        # the Windows shim (agy.exe or agy.cmd): agy-switch __shim <real agy> [agy args...]
+        sys.exit(win_shim_exec(sys.argv[2], sys.argv[3:]))
     if os.path.isdir(OLD_STORE) and not os.path.exists(STORE):
         os.rename(OLD_STORE, STORE)
     db = load_proxy_db()
@@ -2851,14 +3428,7 @@ def main():
     cmd = args[0] if args else "list"
 
     if cmd != "proxy":
-        state, cc = net_ok()
-        if state == "blocked":
-            print("agy-switch: cannot reach Google's API from this network — agy may fail\n"
-                  "  or report 'region not supported'. Fix: agy-switch proxy", file=sys.stderr)
-        elif state == "region":
-            print(f"agy-switch: your current IP region ({cc or '?'}) is not supported by Google AI —\n"
-                  "  agy will report 'region not supported'. Fix: agy-switch proxy\n"
-                  "  (route through a supported region such as JP/SG/US)", file=sys.stderr)
+        warn_net(*net_ok())
 
     if cmd in ("list",):
         name = tui("switch")
@@ -2867,6 +3437,11 @@ def main():
             print(f"switched to '{name}' ({decode_email(live_token())})")
             warn_running_agy()
             agy = shutil.which("agy")
+            if agy and IS_WIN:
+                # Windows exec* spawns a child and exits at once, leaving the
+                # shell and agy fighting over the console — run it and wait
+                signal.signal(signal.SIGINT, lambda *_a: None)
+                sys.exit(subprocess.call([agy]))
             if agy:
                 os.execvp(agy, ["agy"])  # straight into the session
             print("agy not found on PATH — install it, then just run: agy")
@@ -2901,3 +3476,5 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         sys.exit(130)
+    except CredentialStoreError as e:
+        die(str(e))
